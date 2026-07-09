@@ -1,0 +1,64 @@
+# Data products — never commit
+*.fits
+*.fits.gz
+*.fits.fz
+*.fz
+*.npz
+*.dat
+
+# Reduced spectra & intermediate trees (mirrors WARP's output layout)
+reductions/
+reduced_spectra/
+calibration_data/
+rawdata_image/
+spectra_image/
+reduction_log/
+slit_viewer/
+onedspec/
+twodspec/
+SNR_dat/
+database/
+
+# Obsidian (vault lives outside repo, but guard against accidental copies)
+.obsidian/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IRAF / pyraf cruft (in case anyone runs WARP here for comparison)
+uparm/
+login.cl
+pyraf/
+*.par
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local config
+.env
+.envrc
+settings.local.json
+
+# Sphinx build output
+docs/_build/

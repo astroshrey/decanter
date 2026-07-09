@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "decanter"
+version = "0.0.1"
+description = "Pure-Python reduction pipeline for WINERED echelle spectra."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Shreyas Vissapragada", email = "svissa96@gmail.com" }]
+keywords = ["spectroscopy", "echelle", "astronomy", "data-reduction", "winered"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "astropy>=5.3",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.1",
+    "mypy>=1.5",
+]
+jax = [
+    "jax>=0.4",
+    "jaxlib>=0.4",
+]
+docs = [
+    "sphinx>=7",
+    "sphinx-rtd-theme>=2",
+]
+
+[project.scripts]
+decanter = "decanter.cli:main"
+
+[project.urls]
+Repository = "https://github.com/astroshrey/decanter"
+
+[tool.setuptools.packages.find]
+include = ["decanter*"]
+exclude = ["tests*", "spikes*"]
+
+[tool.setuptools.package-data]
+decanter = ["data/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -q --strict-markers"
+markers = [
+    "regression: parity test against a reference WARP reduction (slow, requires data)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY", "RUF"]
+ignore = ["E501"]  # line length is handled by formatter
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_unused_ignores = true
+plugins = ["numpy.typing.mypy_plugin"]
