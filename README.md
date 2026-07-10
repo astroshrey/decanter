@@ -1,10 +1,11 @@
 # decanter
 
-Fast, pure-Python reduction of **WINERED** near-infrared echelle spectra — a
-drop-in [WARP][warp] clone, validated to float32 precision across all three
-modes (HIRES-Y, HIRES-J, WIDE).
+[![tests](https://github.com/astroshrey/decanter/actions/workflows/tests.yml/badge.svg)](https://github.com/astroshrey/decanter/actions/workflows/tests.yml)
+[![docs](https://readthedocs.org/projects/decanter/badge/?version=latest)](https://decanter.readthedocs.io/en/latest/)
 
-[warp]: https://ui.adsabs.harvard.edu/abs/2024PASJ...76..244H/abstract
+Fast, pure-Python reduction of WINERED near-infrared echelle spectra. Currently
+a WARP ([Hamano et al. 2024](https://arxiv.org/abs/2401.04876)) near-clone
+validated across all three modes (HIRES-Y, HIRES-J, and WIDE).
 
 ## Install
 
@@ -25,5 +26,3 @@ spec.wavelength, spec.flux       # vacuum-Å grid, flux
 ```
 
 For a transit, loop over your frames: `[decanter.reduce(o, s, calib) for o, s in pairs]`.
-
-MIT licensed.

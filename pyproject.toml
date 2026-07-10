@@ -44,9 +44,6 @@ docs = [
     "sphinx-rtd-theme>=2",
 ]
 
-[project.scripts]
-decanter = "decanter.cli:main"
-
 [project.urls]
 Repository = "https://github.com/astroshrey/decanter"
 
