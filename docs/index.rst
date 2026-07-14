@@ -26,7 +26,7 @@ Load a calibration set, then reduce your ``(object, sky)`` frame pairs:
    # Point at any calibration-set directory, or a WARP reduction root.
    calib = decanter.Calibration.from_dir("/path/to/calibration_set")
 
-   r = decanter.reduce("WINA00045837.fits", "WINA00045838.fits", calib)
+   r = decanter.reduce("WINA00045837.fits", calib, sky="WINA00045838.fits")
 
    spec = r.obj[(1.30, 163)]        # OrderSpectrum, keyed by (FSR cut, order)
    spec.wavelength, spec.flux       # vacuum-Å grid + flux (counts)
@@ -36,7 +36,7 @@ A whole transit is just a loop — each reduction is independent:
 .. code-block:: python
 
    calib = decanter.Calibration.from_dir(calib_dir)
-   spectra = [decanter.reduce(obj, sky, calib) for obj, sky in frame_pairs]
+   spectra = [decanter.reduce(obj, calib, sky=sky) for obj, sky in frame_pairs]
 
 .. toctree::
    :maxdepth: 2

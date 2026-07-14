@@ -75,9 +75,9 @@ def _read_input(
 
 def reduce(
     obj: Path | NDArray,
-    sky: Path | NDArray | None,
     calib: Calibration,
     *,
+    sky: Path | NDArray | None = None,
     workdir: Path | None = None,
     save_intermediates: bool = False,
     config: Config | None = None,
@@ -85,12 +85,27 @@ def reduce(
     check_calib: bool = True,
     mode: str = "warp",
 ) -> Reduction:
-    """Single-frame reduction. No waveshift by default (only meaningful
-    across frames); pass ``shift_wave`` to inject an externally-measured
-    cross-frame shift (e.g. WARP's ``waveShiftAdopted[i]``, in Å) for
-    apples-to-apples parity against a multi-frame WARP reduction.
+    """Single-frame reduction of one WINERED object frame.
 
-    Pipeline:
+    With ``sky`` given, the sky frame is subtracted first (the usual ABBA
+    nod-subtracted reduction). With ``sky=None`` (the default) the object
+    frame is reduced **on its own** — useful for reducing each nod position
+    independently (A-only, then B-only, ...).
+
+    .. warning::
+        In the ``sky=None`` (no-subtraction) mode the additive components that
+        nod subtraction normally removes are **retained** in the reduced
+        spectrum: sky background emission (including the OH airglow lines),
+        dark current, bias, and stray/scattered light. Cosmic-ray masking is
+        also skipped (it needs the object/sky pair). Treat these products as
+        raw A-position spectra, not background-subtracted science.
+
+    No waveshift is applied by default (only meaningful across frames); pass
+    ``shift_wave`` to inject an externally-measured cross-frame shift (e.g.
+    WARP's ``waveShiftAdopted[i]``, in Å) for apples-to-apples parity against
+    a multi-frame WARP reduction.
+
+    Pipeline (step 1 is skipped when ``sky`` is None):
         1. image2d.sky_subtract  (obj - sky)
         2. image2d.cr_mask       (cosmic-ray detection)
         3. image2d.subtract_apscatter (scattered-light removal)
@@ -107,9 +122,11 @@ def reduce(
 
     Args:
         obj: object frame — Path to a FITS file or a 2D ``ndarray``.
-        sky: sky frame, or None.
-        calib: :class:`Calibration` bundle. Use :meth:`Calibration.from_dir`
-            to auto-discover from a WARP-style ``calibration_data/`` dir.
+        calib: :class:`Calibration` bundle (required). Use
+            :meth:`Calibration.from_dir` to auto-discover it from a
+            calibration-set directory or a WARP reduction root.
+        sky: sky frame to subtract, or None (default) for a no-subtraction
+            A-only reduction — see the warning above.
         workdir: optional output directory. None means in-memory only
             (the returned :class:`Reduction` is the entire output).
         save_intermediates: when True, the returned :class:`Reduction`'s

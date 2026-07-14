@@ -41,7 +41,7 @@ def test_reduce_matches_warp_on_toi2109_decanterref_m163_fsr105() -> None:
     for m163 within the s06+s08 algorithmic noise floor (medrel < 0.01%,
     same shape, same CRVAL1)."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    r = decanter.reduce(_RAW_OBJ, _RAW_SKY, calib)
+    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY)
     spec = r.obj[(1.05, 163)]
 
     warp_data = fits.getdata(_WARP_M163_FSR105).astype(np.float64)
@@ -64,7 +64,7 @@ def test_reduce_returns_intermediates_when_requested(tmp_path: Path) -> None:
     per-stage 2D / per-order arrays."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
     r = decanter.reduce(
-        _RAW_OBJ, _RAW_SKY, calib,
+        _RAW_OBJ, calib, sky=_RAW_SKY,
         workdir=tmp_path, save_intermediates=True,
     )
     # 2D intermediates exist:
@@ -83,7 +83,7 @@ def test_reduce_returns_intermediates_when_requested(tmp_path: Path) -> None:
 def test_reduce_orders_property_lists_26_orders() -> None:
     """Default Config processes all 26 orders 159..184."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    r = decanter.reduce(_RAW_OBJ, _RAW_SKY, calib)
+    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY)
     assert r.orders == tuple(range(159, 185))
     assert r.fsr_cuts == (1.05, 1.3)
 
@@ -94,4 +94,4 @@ def test_reduce_rejects_unimplemented_mode() -> None:
 
     import decanter
     with pytest.raises(ValueError, match="not implemented"):
-        decanter.reduce("obj.fits", None, calib=None, mode="default")
+        decanter.reduce("obj.fits", None, mode="default")

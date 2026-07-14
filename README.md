@@ -19,10 +19,14 @@ pip install -e .
 import decanter
 
 calib = decanter.Calibration.from_dir("path/to/calibration_set")
-r = decanter.reduce("obj.fits", "sky.fits", calib)   # one (object, sky) pair
+r = decanter.reduce("obj.fits", calib, sky="sky.fits")   # nod-subtracted (A−B)
 
 spec = r.obj[(1.30, 163)]        # order 163 at FSR cut 1.30
 spec.wavelength, spec.flux       # vacuum-Å grid, flux
 ```
 
-For a transit, loop over your frames: `[decanter.reduce(o, s, calib) for o, s in pairs]`.
+Omit `sky=` to reduce a single nod position on its own: `decanter.reduce("obj.fits", calib)`.
+Without a sky frame there is no nod subtraction, so the background emission (OH
+airglow lines), dark current, bias, and stray light are **retained** in the spectrum.
+
+For a transit, loop over your frames: `[decanter.reduce(o, calib, sky=s) for o, s in pairs]`.
