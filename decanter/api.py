@@ -84,6 +84,7 @@ def reduce(
     shift_wave: float = 0.0,
     check_calib: bool = True,
     mode: str = "warp",
+    subtract_background: bool = False,
 ) -> Reduction:
     """Single-frame reduction of one WINERED object frame.
 
@@ -144,6 +145,14 @@ def reduce(
             mode/slit/setting before reducing (default True). Raises
             :class:`~decanter.calib.CalibrationMismatch` on a mismatch; set
             False to bypass (e.g. for a deliberately re-purposed set).
+        subtract_background: subtract a local background during extraction
+            (default False). For each order, a background level is estimated
+            per dispersion row from the slit flanking the aperture and
+            subtracted from the object box sum (IRAF apall's ``background``
+            option). This suppresses the additive slit background — notably
+            the OH airglow lines — so it is the way to clean up an A-only
+            (``sky=None``) spectrum, or to knock down OH residuals left by an
+            imperfect A-B subtraction. Applied to the object path only.
         mode: reduction recipe. Only ``"warp"`` (bit-for-bit WARP clone) is
             implemented today; the argument exists so future recipes (e.g.
             a ``"default"`` with decanter's own improved steps) are a
@@ -278,7 +287,8 @@ def reduce(
             ap = apset_multi.apertures[m]
             ap_low, ap_high = float(ap.entry.low), float(ap.entry.high)
             trace_x = _infer_trace_x(strip_arr)
-        obj_1d[m] = box_extract(strip_arr, trace_x, ap_low=ap_low, ap_high=ap_high)
+        obj_1d[m] = box_extract(strip_arr, trace_x, ap_low=ap_low, ap_high=ap_high,
+                                subtract_background=subtract_background)
         if m in strips_sky_arrays:
             sky_1d[m] = box_extract(
                 strips_sky_arrays[m], trace_x, ap_low=ap_low, ap_high=ap_high,

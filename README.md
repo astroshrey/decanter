@@ -28,5 +28,7 @@ spec.wavelength, spec.flux       # vacuum-Å grid, flux
 Omit `sky=` to reduce a single nod position on its own: `decanter.reduce("obj.fits", calib)`.
 Without a sky frame there is no nod subtraction, so the background emission (OH
 airglow lines), dark current, bias, and stray light are **retained** in the spectrum.
+Pass `subtract_background=True` to estimate and remove that background from the
+slit during extraction (suppressing the OH lines).
 
 For a transit, loop over your frames: `[decanter.reduce(o, calib, sky=s) for o, s in pairs]`.

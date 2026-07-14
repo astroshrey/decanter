@@ -164,12 +164,40 @@ def _sanitize_objname(raw: str) -> str:
     return name
 
 
+def _row_background(
+    row: NDArray[np.float32], x1: float, x2: float, W: int,
+    bg_gap: float, bg_width: float,
+) -> float | None:
+    """Median background per pixel from the slit bands flanking an aperture.
+
+    Samples whole pixels in ``[x1 - bg_gap - bg_width, x1 - bg_gap]`` and
+    ``[x2 + bg_gap, x2 + bg_gap + bg_width]`` (1-indexed, clipped to
+    ``[1, W]``) — the off-star slit where the OH airglow and other additive
+    background sit. Returns the median, or None if no sample pixels fall on
+    the strip. Median (not mean) rejects the stellar wings, cosmic rays, and
+    neighbouring-order leakage.
+    """
+    samples = []
+    for lo, hi in ((x1 - bg_gap - bg_width, x1 - bg_gap),
+                   (x2 + bg_gap, x2 + bg_gap + bg_width)):
+        i0 = max(1, int(np.ceil(lo)))
+        i1 = min(W, int(np.floor(hi)))
+        if i1 >= i0:
+            samples.append(row[i0 - 1:i1])            # 1-indexed -> 0-indexed
+    if not samples:
+        return None
+    return float(np.median(np.concatenate(samples)))
+
+
 def box_extract(
     image: NDArray[np.floating],
     trace_x: NDArray[np.floating],
     *,
     ap_low: float,
     ap_high: float,
+    subtract_background: bool = False,
+    bg_gap: float = 3.0,
+    bg_width: float | None = None,
 ) -> NDArray[np.float32]:
     """Box-sum extraction with IRAF-faithful float32 left-to-right accumulation.
 
@@ -177,6 +205,16 @@ def box_extract(
     its edge-weight helper ``ap_edge`` (line 1594) for the unweighted
     box-sum case (no profile interpolator, no sky subtraction inside the
     extraction call).
+
+    When ``subtract_background`` is set, a local background is estimated per
+    dispersion row from the slit bands flanking the aperture (IRAF apall's
+    ``background`` option with ``b_sample`` regions) and subtracted from the
+    box sum: ``flux -= median_background_per_pixel * aperture_width``. This
+    suppresses the additive slit background — including the OH airglow that
+    fills the slit — which is exactly what a background region is for.
+    ``bg_gap`` is the guard gap (px) between the aperture edge and each
+    background band; ``bg_width`` is each band's width (px, default = the
+    aperture width).
 
     For each y row:
       1. ``x1 = max(0.5, trace_x + ap_low)``,
@@ -253,6 +291,12 @@ def box_extract(
         sval = np.float32(wt1 * img32[iy, ix1 - 1] + wt2 * img32[iy, ix2 - 1])
         for ix in range(ix1 + 1, ix2):  # interior pixels at full weight
             sval = np.float32(sval + img32[iy, ix - 1])
+        if subtract_background:
+            bw = (ap_high - ap_low) if bg_width is None else bg_width
+            bkg = _row_background(img32[iy], x1, x2, W, bg_gap, bw)
+            if bkg is not None:
+                # subtract the background under the aperture: level x width
+                sval = np.float32(sval - np.float32(bkg) * np.float32(x2 - x1))
         out[iy] = sval
     return out
 
