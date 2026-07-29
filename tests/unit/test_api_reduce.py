@@ -88,6 +88,36 @@ def test_reduce_orders_property_lists_26_orders() -> None:
     assert r.fsr_cuts == (1.05, 1.3)
 
 
+@pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
+def test_standalone_trace_matches_warp_locked() -> None:
+    """The WARP-independent extraction (multihole trans reference + center
+    search, used when no per-frame trans DB is present) reproduces the
+    WARP-locked path to the float32 parity floor across all orders.
+
+    This guards the standalone trace/aperture: a WARP reduction root ships
+    both the per-frame trans DBs (locked path) and the multihole trans
+    references (standalone path), so dropping the former forces the standalone
+    solve on the very same frame and calibration.
+    """
+    import dataclasses
+
+    calib_locked = decanter.Calibration.from_dir(_TOI_PYWARPREF)
+    assert calib_locked.trans_apdbs, "fixture should carry per-frame trans DBs"
+    assert calib_locked.ref_trans_apdbs, "fixture should carry multihole trans refs"
+    calib_standalone = dataclasses.replace(calib_locked, trans_apdbs=None)
+
+    r_locked = decanter.reduce(_RAW_OBJ, calib_locked, sky=_RAW_SKY)
+    r_standalone = decanter.reduce(_RAW_OBJ, calib_standalone, sky=_RAW_SKY)
+
+    worst = 0.0
+    for key, spec in r_locked.obj.items():
+        a = r_standalone.obj[key].flux.astype(np.float64)
+        b = spec.flux.astype(np.float64)
+        medrel = float(np.median(np.abs(a - b) / np.maximum(np.abs(b), 1.0)))
+        worst = max(worst, medrel)
+    assert worst < 5e-3, f"standalone vs WARP-locked medrel too high: {worst * 100:.3f}%"
+
+
 def test_reduce_rejects_unimplemented_mode() -> None:
     """Only mode='warp' exists today; other recipes raise before any I/O."""
     import pytest

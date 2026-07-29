@@ -25,8 +25,8 @@ from decanter._reduction import Intermediates, OrderSpectrum, Reduction
 from decanter.calib import Calibration
 from decanter.calib.aperture import ApertureSet
 from decanter.config import Config
+from decanter.extract.aperture_solve import solve_frame_aperture
 from decanter.extract.box_extract_1d import box_extract
-from decanter.extract.psf_center import _infer_trace_x
 from decanter.image2d import (
     cr_mask, fix_bad_pixels, flatfield_divide, sky_subtract, subtract_apscatter,
 )
@@ -266,11 +266,27 @@ def reduce(
     trans_apdbs = calib.trans_apdbs or {}
     obj_1d: dict[int, NDArray] = {}
     sky_1d: dict[int, NDArray] = {}
+
+    # When per-frame WARP trans aperture DBs are supplied (a WARP reduction
+    # root), lock the extraction to WARP's exact per-frame trace for bit
+    # parity. Otherwise use the WARP-independent path: the multihole trans
+    # reference trace + a frame-constant aperture solved by center search
+    # (see extract.aperture_solve — this mirrors WARP's normal science path).
+    frame_ap = None
+    if not trans_apdbs:
+        ref_trans = calib.ref_trans_apdbs
+        if not ref_trans:
+            raise ValueError(
+                "calibration set has no multihole trans reference apertures "
+                "(ap{aptrans}_{m}trans) and no per-frame trans DBs were found; "
+                "cannot determine the extraction trace."
+            )
+        frame_ap = solve_frame_aperture(
+            strips_obj, ref_trans, abba=_is_abba(nodpos),
+        )
+
     for m, strip in strips_obj.items():
         strip_arr = strip.data
-        # Read trace + ap-window from the WARP-supplied trans aperture DB
-        # when available; otherwise infer the trace via argmax+legfit and
-        # use the multihole aperture window.
         if m in trans_apdbs:
             trans_set = ApertureSet.load(
                 trans_apdbs[m], array_length=strip_arr.shape[0]
@@ -280,13 +296,14 @@ def reduce(
                 ap_low, ap_high = float(trans_ap.entry.low), float(trans_ap.entry.high)
                 trace_x = trans_ap.trace_x
             else:
-                ap = apset_multi.apertures[m]
-                ap_low, ap_high = float(ap.entry.low), float(ap.entry.high)
-                trace_x = _infer_trace_x(strip_arr)
+                sub = solve_frame_aperture(
+                    {m: strip}, calib.ref_trans_apdbs or {}, abba=_is_abba(nodpos),
+                )
+                trace_x = sub.traces[m]
+                ap_low, ap_high = sub.ap_low, sub.ap_high
         else:
-            ap = apset_multi.apertures[m]
-            ap_low, ap_high = float(ap.entry.low), float(ap.entry.high)
-            trace_x = _infer_trace_x(strip_arr)
+            trace_x = frame_ap.traces[m]
+            ap_low, ap_high = frame_ap.ap_low, frame_ap.ap_high
         obj_1d[m] = box_extract(strip_arr, trace_x, ap_low=ap_low, ap_high=ap_high,
                                 subtract_background=subtract_background)
         if m in strips_sky_arrays:

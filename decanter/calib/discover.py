@@ -84,9 +84,16 @@ class Calibration:
             (commonly the same as ``fc_dir``).
         id_refname: basename for the ``id<refname>`` family (no ``id`` prefix).
         fsr_table: path to the FSR wavelength-bound table (s13).
-        trans_apdbs: optional per-order WARP-supplied trans aperture DBs
-            (``ap*_NO{i}_sscfm_m{m}trans``). Used to lock 1D extraction to
-            WARP's exact trace for parity benches.
+        ref_trans_apdbs: per-order multihole *trans* reference aperture DBs
+            (``ap{aptrans}_{m}trans``), a standard calibration product. These
+            give the rectified-strip reference trace and the wide multihole
+            slit window that WARP's ``centersearch_fortrans`` measures the
+            per-frame stellar shift against — the WARP-independent extraction
+            path uses them.
+        trans_apdbs: optional per-order WARP-supplied *per-frame* trans
+            aperture DBs (``ap*_NO{i}_sscfm_m{m}trans``, a reduction output,
+            not a calibration product). When present, 1D extraction is locked
+            to WARP's exact per-frame trace for bit-parity benches.
         instrument: the mode/slit/setting this set was taken in (read from
             the comp FITS header), or None if it could not be determined.
             Used by :meth:`assert_matches` to reject mismatched science data.
@@ -102,6 +109,7 @@ class Calibration:
     id_dir: Path
     id_refname: str
     fsr_table: Path
+    ref_trans_apdbs: dict[int, Path] | None = None
     trans_apdbs: dict[int, Path] | None = None
     instrument: InstrumentConfig | None = None
 
@@ -191,7 +199,18 @@ class Calibration:
         # id_refname is the comp filename stem (e.g. comp_HIRES-Y100_..._fm_ecall).
         id_refname = comp.stem
 
-        # Discover per-order trans aperture DBs (best-effort).
+        # Discover the multihole trans reference apertures (a calibration
+        # product): ap{aptrans}_{m}trans, one per echelle order.
+        ref_trans_apdbs: dict[int, Path] = {}
+        for cand in shared_db.glob(f"ap{fc_refname}_*trans"):
+            try:
+                mstr = cand.name.rsplit("_", 1)[1][: -len("trans")]
+                ref_trans_apdbs[int(mstr)] = cand
+            except (IndexError, ValueError):
+                continue
+
+        # Discover per-frame trans aperture DBs (a reduction output, present
+        # only when pointed at a WARP reduction root) — best-effort.
         trans_apdbs: dict[int, Path] = {}
         for cand in shared_db.glob("ap*_NO1_sscfm_m*trans"):
             try:
@@ -221,6 +240,7 @@ class Calibration:
             id_dir=shared_db,
             id_refname=id_refname,
             fsr_table=fsr_table,
+            ref_trans_apdbs=ref_trans_apdbs or None,
             trans_apdbs=trans_apdbs or None,
             instrument=instrument,
         )
