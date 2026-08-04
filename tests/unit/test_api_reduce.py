@@ -118,6 +118,20 @@ def test_standalone_trace_matches_warp_locked() -> None:
     assert worst < 5e-3, f"standalone vs WARP-locked medrel too high: {worst * 100:.3f}%"
 
 
+@pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
+def test_reduce_a_only_no_sky() -> None:
+    """Reducing a single nod position (sky=None) works end to end.
+
+    Guards the A-only path: with no sky frame the nod pattern must still be
+    resolved for the center-search aperture solve (regression for a NameError
+    on ``nodpos`` when the CR-mask branch was skipped)."""
+    calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
+    r = decanter.reduce(_RAW_OBJ, calib)                       # no sky
+    assert (1.05, 163) in r.obj and r.obj[(1.05, 163)].flux.size > 0
+    r_bg = decanter.reduce(_RAW_OBJ, calib, subtract_background=True)
+    assert (1.05, 163) in r_bg.obj and r_bg.obj[(1.05, 163)].flux.size > 0
+
+
 def test_reduce_rejects_unimplemented_mode() -> None:
     """Only mode='warp' exists today; other recipes raise before any I/O."""
     import pytest

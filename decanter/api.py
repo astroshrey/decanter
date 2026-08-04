@@ -176,6 +176,10 @@ def reduce(
     raw_objname = str(headers.get(obj_header, "OBJECT", default=obj_path.stem
                                   if obj_path else "frame"))
     objname = _sanitize_objname(raw_objname)
+    # Nod pattern drives both the CR mask and the center-search O-position
+    # rejection; resolve it once here so both the sky and A-only (sky=None)
+    # paths have it defined.
+    nodpos = str(headers.get(obj_header, "NODPOS", default="A1"))
     apset_multi = ApertureSet.load(calib.apdb_multihole)
     apset_apsc = ApertureSet.load(calib.apdb_apsc)
     static_bp, _ = _fits.read_image(calib.static_bp_mask)
@@ -192,7 +196,6 @@ def reduce(
 
     # --- s02 cosmic-ray mask ----------------------------------------------
     if cfg.flag_bpmask and sky_data is not None:
-        nodpos = str(headers.get(obj_header, "NODPOS", default="A1"))
         mask = cr_mask(
             diff, obj_data, sky_data, apset_multi, static_bp,
             nodpos=nodpos,
