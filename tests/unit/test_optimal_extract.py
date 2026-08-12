@@ -51,6 +51,17 @@ def test_optimal_snr_beats_box():
     assert box.shape == (strip.shape[0],)
 
 
+def test_optimal_handles_negative_nod_star():
+    """ABBA obj-sky frames can have a NEGATIVE star; optimal must recover it
+    with the same magnitude as a positive star (regression for a sawtooth that
+    corrupted transit time series)."""
+    strip, trace, flux = _synthetic_strip()
+    pos = optimal_extract(strip, trace, ap_low=-12.0, ap_high=12.0)
+    neg = optimal_extract(-strip, trace, ap_low=-12.0, ap_high=12.0)
+    assert np.median(neg) < 0                       # sign preserved
+    assert abs(np.median(neg) + np.median(pos)) / flux < 0.02   # same magnitude
+
+
 def test_optimal_rejects_bad_aperture():
     strip, trace, _ = _synthetic_strip()
     try:

@@ -14,6 +14,7 @@ work uses :func:`reduce` in a loop and keeps each frame independent.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,7 @@ from decanter.io.fsr import load as load_fsr
 from decanter.rectify import rectify_orders
 from decanter.utils.cosmic_ray import ndr_from_header
 from decanter.waveshift.apply import apply_waveshift_one_order
+from decanter.waveshift.measure import waveshift_clip, waveshift_one_order
 from decanter.wavelength import dispcor_one_order, truncate_spectrum
 
 _OBJNAME_BAD_CHARS: tuple[str, ...] = (" ", "'", "\"", "#", "/")
@@ -332,27 +334,57 @@ def reduce(
         inter.spectra_1d = dict(obj_1d)
         inter.sky_1d = dict(sky_1d)
 
-    # --- s11 truncate (shift=shift_wave) -> 4095 px, matches WARP -----------
-    # Even with no cross-frame shift, WARP runs scopy(rebin=YES) to truncate
-    # from the 5628-px rectified strip to the [1, 2048] Å range (4095 px,
-    # matching the comp file's pixel count). That sets the input length for
-    # dispcor; without this step dispcor's output is 5628 px and downstream
-    # FSR truncate shapes diverge from WARP.
+    strips_lambda = {m: (strips_obj[m].lambda_min, strips_obj[m].dy) for m in obj_1d}
+    if save_intermediates:
+        inter.strip_wcs = strips_lambda
+
+    r = _finalize_wavelength(
+        obj_1d, sky_1d, strips_lambda, objname, obj_path, sky_path,
+        calib, cfg, inter, shift_wave=shift_wave,
+        save_intermediates=save_intermediates,
+    )
+    if workdir is not None:
+        r.write_to(workdir, save_intermediates=save_intermediates)
+    return r
+
+
+def _finalize_wavelength(
+    obj_1d: dict[int, NDArray],
+    sky_1d: dict[int, NDArray],
+    strips_lambda: dict[int, tuple[float, float]],
+    objname: str,
+    obj_path: Path | None,
+    sky_path: Path | None,
+    calib: Calibration,
+    cfg: Config,
+    inter: Intermediates,
+    *,
+    shift_wave: float,
+    save_intermediates: bool,
+) -> Reduction:
+    """s11–s13: truncate (with optional shift) → dispcor → FSR cut → Reduction.
+
+    Factored out of :func:`reduce` so the multi-frame driver can re-run this
+    cheap tail with a per-frame ``shift_wave`` without repeating the expensive
+    2D + rectify + extract work. ``strips_lambda`` maps order → the rectified
+    strip's ``(lambda_min, dy)`` linear-WCS pair (the only thing the s11
+    truncate needs from s06).
+    """
+    # --- s11 truncate (shift=shift_wave). Even at shift 0, WARP runs
+    # scopy(rebin=YES) to truncate the rectified strip to the [1, 2048] Å
+    # range, setting the input length for dispcor.
     obj_truncated: dict[int, tuple[NDArray, _astrofits.Header]] = {}
     sky_truncated: dict[int, tuple[NDArray, _astrofits.Header]] = {}
     for m, spec in obj_1d.items():
-        strip = strips_obj[m]
+        lambda_min, dy = strips_lambda[m]
         h = _astrofits.Header()
-        h["CRVAL1"] = strip.lambda_min
-        h["CDELT1"] = strip.dy
+        h["CRVAL1"] = lambda_min
+        h["CDELT1"] = dy
         h["CRPIX1"] = 1.0
         obj_truncated[m] = apply_waveshift_one_order(spec, h, shift_wave=shift_wave)
         if m in sky_1d:
-            # WARP never waveshifts the sky path (truncate only) — see
-            # bench_sky_multi_order.py; sky always gets shift 0.
-            sky_truncated[m] = apply_waveshift_one_order(
-                sky_1d[m], h, shift_wave=0.0,
-            )
+            # WARP never waveshifts the sky path (truncate only); sky shift = 0.
+            sky_truncated[m] = apply_waveshift_one_order(sky_1d[m], h, shift_wave=0.0)
 
     # --- s12 dispcor per order -------------------------------------------
     obj_dispcor: dict[int, tuple[NDArray, _astrofits.Header]] = {}
@@ -405,7 +437,7 @@ def reduce(
             if spec is not None:
                 sky_out[(cut, m)] = spec
 
-    r = Reduction(
+    return Reduction(
         obj_name=objname,
         obj_path=obj_path,
         sky_path=sky_path,
@@ -414,21 +446,139 @@ def reduce(
         intermediates=inter,
     )
 
-    if workdir is not None:
-        r.write_to(workdir, save_intermediates=save_intermediates)
 
-    return r
+@dataclass(frozen=True, slots=True)
+class TransitSeries:
+    """A cross-frame-aligned set of per-frame reductions (a transit time series).
 
-
-def combine(*args: Any, **kwargs: Any) -> None:
-    """Stub for multi-frame SNR-weighted combination after cross-frame waveshift.
-
-    Raises :class:`NotImplementedError` for now. For transit-style
-    per-frame analysis, loop :func:`reduce` over your frame list and
-    keep each frame's output separate.
+    Attributes:
+        reductions: one :class:`Reduction` per frame, wavelength-aligned to
+            ``reductions[refid]`` via the measured cross-frame shift.
+        shifts: per-frame wavelength shift applied (Å), length == n frames.
+        refid: index of the reference frame (its shift is 0).
     """
-    raise NotImplementedError(
-        "decanter.combine() is not yet implemented. For per-frame analysis "
-        "(e.g. transit time series), loop decanter.reduce() over your frame "
-        "pairs — each call produces an independent Reduction."
+
+    reductions: list
+    shifts: NDArray
+    refid: int
+
+
+def reduce_many(
+    pairs: list[tuple],
+    calib: Calibration,
+    *,
+    refid: int | None = None,
+    config: Config | None = None,
+    extract: str = "box",
+    check_calib: bool = True,
+    subtract_background: bool = False,
+    align: bool = True,
+) -> TransitSeries:
+    """Reduce a list of ``(obj, sky)`` frame pairs and align them in wavelength.
+
+    Runs :func:`reduce` on each pair once (the expensive part), then measures a
+    per-frame cross-frame wavelength shift by cross-correlating the extracted
+    1D spectra against a reference frame (WARP's ``ccwaveshift`` / s10), and
+    re-runs only the cheap wavelength-finalize tail with each frame's shift so
+    every frame lands on the reference frame's grid.
+
+    Args:
+        pairs: ``[(obj, sky), ...]`` — paths or arrays, as for :func:`reduce`.
+        refid: reference-frame index; default = the highest-flux frame.
+        extract: ``"box"`` or ``"optimal"`` (applied to every frame).
+        align: if False, skip shift measurement (shifts all 0) — useful to
+            get the per-frame reductions without cross-frame alignment.
+
+    Returns:
+        A :class:`TransitSeries`.
+    """
+    cfg = config or Config()
+    base = [
+        reduce(o, calib, sky=s, config=cfg, extract=extract,
+               check_calib=check_calib, subtract_background=subtract_background,
+               save_intermediates=True, shift_wave=0.0)
+        for (o, s) in pairs
+    ]
+    n = len(base)
+    if not align or n < 2:
+        return TransitSeries(reductions=base, shifts=np.zeros(n), refid=refid or 0)
+
+    orders = sorted(set.intersection(*[set(r.intermediates.spectra_1d) for r in base]))
+    # Truncated 1D per order per frame (the WARP `_m###c` cross-correlation input).
+    trunc: dict[int, list] = {m: [] for m in orders}
+    for r in base:
+        it = r.intermediates
+        for m in orders:
+            lam, dy = it.strip_wcs[m]
+            h = _astrofits.Header()
+            h["CRVAL1"] = lam; h["CDELT1"] = dy; h["CRPIX1"] = 1.0
+            t, _ = apply_waveshift_one_order(it.spectra_1d[m], h, shift_wave=0.0)
+            trunc[m].append(np.asarray(t, float))
+
+    ref_ord = 163 if 163 in orders else orders[len(orders) // 2]
+    if refid is None:
+        refid = int(np.argmax([np.nanmedian(trunc[ref_ord][i]) for i in range(n)]))
+    dy = base[0].intermediates.strip_wcs[orders[0]][1]   # common across orders
+    rows = []
+    for m in orders:
+        L = min(s.size for s in trunc[m])
+        rows.append(waveshift_one_order([s[:L] for s in trunc[m]], dy, refid=refid))
+    shift_avg, _, _, _ = waveshift_clip(np.array(rows))
+
+    aligned = []
+    for r, sh in zip(base, shift_avg):
+        it = r.intermediates
+        aligned.append(_finalize_wavelength(
+            it.spectra_1d, it.sky_1d, it.strip_wcs, r.obj_name, r.obj_path,
+            r.sky_path, calib, cfg, it, shift_wave=float(sh),
+            save_intermediates=True,
+        ))
+    return TransitSeries(reductions=aligned, shifts=shift_avg, refid=refid)
+
+
+def combine(
+    reductions: list | TransitSeries,
+    *,
+    cut: float | None = None,
+    weight: str = "flux",
+) -> Reduction:
+    """SNR-weighted combine of aligned per-frame reductions into a master.
+
+    Stacks each ``(fsr_cut, order)`` spectrum present in every frame onto the
+    reference grid. Intended for a master (e.g. an out-of-transit template);
+    for a transit time series keep :class:`TransitSeries.reductions` separate.
+
+    Args:
+        reductions: a list of :class:`Reduction` (ideally wavelength-aligned,
+            e.g. from :func:`reduce_many`) or a :class:`TransitSeries`.
+        cut: restrict to one FSR cut; default combines every cut present.
+        weight: ``"flux"`` (photon-weighted, ~SNR^2) or ``"uniform"``.
+
+    Returns:
+        A :class:`Reduction` whose ``obj`` holds the combined spectra.
+    """
+    reds = reductions.reductions if isinstance(reductions, TransitSeries) else list(reductions)
+    if not reds:
+        raise ValueError("combine() needs at least one reduction")
+    keys = set.intersection(*[set(r.obj) for r in reds])
+    if cut is not None:
+        keys = {k for k in keys if k[0] == cut}
+    obj_out: dict[tuple[float, int], OrderSpectrum] = {}
+    for key in sorted(keys):
+        specs = [r.obj[key] for r in reds]
+        L = min(s.flux.size for s in specs)
+        F = np.array([np.asarray(s.flux[:L], float) for s in specs])
+        if weight == "uniform":
+            w = np.ones(len(specs))
+        else:
+            w = np.array([max(float(np.nanmedian(s.flux[:L])), 1e-9) for s in specs])
+        stack = np.average(F, axis=0, weights=w)
+        ref = specs[0]
+        obj_out[key] = OrderSpectrum(
+            order=key[1], fsr_cut=key[0], flux=stack.astype(np.float32),
+            crval1=ref.crval1, cdelt1=ref.cdelt1, crpix1=ref.crpix1,
+        )
+    return Reduction(
+        obj_name=reds[0].obj_name, obj_path=None, sky_path=None,
+        obj=obj_out, sky=None,
     )

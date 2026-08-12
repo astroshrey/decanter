@@ -42,10 +42,32 @@ def _background_level(row: NDArray[np.floating], lo: int, hi: int, W: int) -> fl
     return float(np.median(flank)) if flank.size else 0.0
 
 
+def _star_sign(image: NDArray[np.floating], center: NDArray[np.floating], half: float) -> float:
+    """+1 or -1: sign of the star in the strip.
+
+    In ABBA nod subtraction, obj-sky yields a *negative* star for the frames
+    where the object sits in the subtracted nod position. The profile machinery
+    assumes a positive bump, so the strip is worked in sign-corrected space.
+    """
+    H, W = image.shape
+    tot = 0.0
+    for y in range(0, H, _PROFILE_ROW_STEP):
+        c = int(round(center[y])); lo = c - int(half); hi = c + int(half) + 1
+        if lo < 0 or hi > W:
+            continue
+        seg = image[y, lo:hi].astype(np.float64)
+        tot += seg.sum() - np.median(image[y]) * (hi - lo)
+    return -1.0 if tot < 0 else 1.0
+
+
 def _build_profile(
-    image: NDArray[np.floating], center: NDArray[np.floating], half: float
+    image: NDArray[np.floating], center: NDArray[np.floating], half: float, sign: float
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Empirical unit-sum spatial profile on an integer offset grid."""
+    """Empirical unit-sum spatial profile on an integer offset grid.
+
+    Built in sign-corrected space (``sign * image``) so a negative-nod star is
+    treated as a positive bump; the returned profile is always positive.
+    """
     H, W = image.shape
     phw = int(np.ceil(half)) + _PROFILE_PAD
     offs = np.arange(-phw, phw + 1, dtype=np.float64)
@@ -55,7 +77,7 @@ def _build_profile(
         c = center[y]
         if c - phw < 0 or c + phw >= W:
             continue
-        seg = np.interp(c + offs, cols, image[y].astype(np.float64))
+        seg = sign * np.interp(c + offs, cols, image[y].astype(np.float64))
         seg = seg - np.median(seg)          # remove local background pedestal
         total = seg[seg > 0].sum()
         if total <= 0:
@@ -129,7 +151,8 @@ def optimal_extract(
     if half <= 0:
         raise ValueError(f"ap_high ({ap_high}) must exceed ap_low ({ap_low})")
 
-    offs, prof = _build_profile(img, center, half)
+    sign = _star_sign(img, center, half)
+    offs, prof = _build_profile(img, center, half, sign)
     rv = _read_variance(img, center, half) if read_var is None else float(read_var)
 
     out = np.zeros(H, dtype=np.float32)
@@ -150,7 +173,7 @@ def optimal_extract(
         # Variance from the PROFILE MODEL, not the observed data: using D
         # directly biases the optimal estimate low (pixels that fluctuate high
         # get down-weighted). f0 is the box total for this row (Horne 1986).
-        f0 = max(D.sum(), 0.0)
+        f0 = max(sign * D.sum(), 0.0)
         V = rv + np.maximum(f0 * p, 0.0) / gain
         w = p / V
         denom = (w * p).sum()

@@ -29,10 +29,33 @@ _LIVE_DATA_OK = (
 )
 
 
-def test_combine_is_a_stub() -> None:
-    """decanter.combine raises NotImplementedError pointing users to reduce()."""
-    with pytest.raises(NotImplementedError, match="loop decanter.reduce"):
-        decanter.combine([], None)
+def test_combine_rejects_empty() -> None:
+    """combine() needs at least one reduction."""
+    with pytest.raises(ValueError, match="at least one"):
+        decanter.combine([])
+
+
+@pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
+def test_reduce_many_aligns_and_combines() -> None:
+    """reduce_many() aligns frames and combine() stacks them onto one grid.
+
+    Reducing the same pair twice gives a 2-frame series with zero relative
+    shift; the combined master matches the per-frame spectra."""
+    calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
+    series = decanter.reduce_many([(_RAW_OBJ, _RAW_SKY), (_RAW_OBJ, _RAW_SKY)], calib)
+    assert len(series.reductions) == 2
+    assert series.shifts.shape == (2,)
+    assert abs(float(series.shifts[series.refid])) < 1e-9      # reference shift is 0
+    # Identical frames -> shift at the fine-search grid floor (~0.01 px), not
+    # necessarily bit-zero.
+    cdelt = series.reductions[0].obj[(1.05, 163)].cdelt1
+    assert np.all(np.abs(series.shifts) < 0.05 * cdelt)        # < 0.05 px
+    master = decanter.combine(series, cut=1.05)
+    a = master.obj[(1.05, 163)].flux.astype(float)
+    b = series.reductions[0].obj[(1.05, 163)].flux.astype(float)
+    assert a.shape == b.shape
+    an, bn = a / np.median(a), b / np.median(b)
+    assert np.median(np.abs(an - bn)) < 5e-3                   # master ~ per-frame spectrum
 
 
 @pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")

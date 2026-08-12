@@ -65,6 +65,7 @@ class Intermediates:
     obj_sscf: NDArray | None = None       # flat-divided (s04 _sscf)
     obj_sscfm: NDArray | None = None      # fixpix'd, final 2D (s05 _sscfm)
     strips_obj: dict[int, NDArray] = field(default_factory=dict)  # s06 per order
+    strip_wcs: dict[int, tuple] = field(default_factory=dict)     # s06 per order (lambda_min, dy)
     spectra_1d: dict[int, NDArray] = field(default_factory=dict)  # s08 per order
     spectra_dispcor: dict[int, NDArray] = field(default_factory=dict)  # s12 per order
 

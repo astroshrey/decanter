@@ -26,7 +26,7 @@ See ``CLAUDE.md`` / ``HANDOFF.md`` for architecture notes and
 __version__ = "0.0.1"
 
 from decanter._reduction import Intermediates, OrderSpectrum, Reduction
-from decanter.api import combine, reduce
+from decanter.api import TransitSeries, combine, reduce, reduce_many
 from decanter.calib import Calibration, CalibrationMismatch, InstrumentConfig
 from decanter.config import Config
 
@@ -38,6 +38,8 @@ __all__ = [
     "Intermediates",
     "OrderSpectrum",
     "Reduction",
+    "TransitSeries",
     "combine",
     "reduce",
+    "reduce_many",
 ]
