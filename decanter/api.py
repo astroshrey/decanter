@@ -27,6 +27,7 @@ from decanter.calib.aperture import ApertureSet
 from decanter.config import Config
 from decanter.extract.aperture_solve import solve_frame_aperture
 from decanter.extract.box_extract_1d import box_extract
+from decanter.extract.optimal_extract import optimal_extract
 from decanter.image2d import (
     cr_mask, fix_bad_pixels, flatfield_divide, sky_subtract, subtract_apscatter,
 )
@@ -85,6 +86,7 @@ def reduce(
     check_calib: bool = True,
     mode: str = "warp",
     subtract_background: bool = False,
+    extract: str = "box",
 ) -> Reduction:
     """Single-frame reduction of one WINERED object frame.
 
@@ -157,6 +159,10 @@ def reduce(
             implemented today; the argument exists so future recipes (e.g.
             a ``"default"`` with decanter's own improved steps) are a
             drop-in opt-in. Any other value raises ``ValueError``.
+        extract: 1D extraction method. ``"box"`` (default) is the WARP-parity
+            box sum; ``"optimal"`` is Horne (1986) profile-weighted extraction
+            (higher SNR, an algorithmic upgrade over WARP — see
+            :mod:`decanter.extract.optimal_extract`).
 
     Returns:
         :class:`Reduction` carrying per-(fsr_cut, order) calibrated 1D
@@ -167,6 +173,8 @@ def reduce(
         raise ValueError(
             f"mode={mode!r} is not implemented; only 'warp' (the WARP-clone "
             f"recipe) is available today")
+    if extract not in ("box", "optimal"):
+        raise ValueError(f"extract={extract!r} must be 'box' or 'optimal'")
     cfg = config or Config()
     obj_data, obj_header, sky_data, sky_header, obj_path, sky_path = _read_input(
         obj, sky,
@@ -307,12 +315,19 @@ def reduce(
         else:
             trace_x = frame_ap.traces[m]
             ap_low, ap_high = frame_ap.ap_low, frame_ap.ap_high
-        obj_1d[m] = box_extract(strip_arr, trace_x, ap_low=ap_low, ap_high=ap_high,
-                                subtract_background=subtract_background)
-        if m in strips_sky_arrays:
-            sky_1d[m] = box_extract(
-                strips_sky_arrays[m], trace_x, ap_low=ap_low, ap_high=ap_high,
-            )
+        if extract == "optimal":
+            obj_1d[m] = optimal_extract(strip_arr, trace_x,
+                                        ap_low=ap_low, ap_high=ap_high)
+            if m in strips_sky_arrays:
+                sky_1d[m] = optimal_extract(strips_sky_arrays[m], trace_x,
+                                            ap_low=ap_low, ap_high=ap_high)
+        else:
+            obj_1d[m] = box_extract(strip_arr, trace_x, ap_low=ap_low, ap_high=ap_high,
+                                    subtract_background=subtract_background)
+            if m in strips_sky_arrays:
+                sky_1d[m] = box_extract(
+                    strips_sky_arrays[m], trace_x, ap_low=ap_low, ap_high=ap_high,
+                )
     if save_intermediates:
         inter.spectra_1d = dict(obj_1d)
         inter.sky_1d = dict(sky_1d)
