@@ -52,7 +52,7 @@ include = ["decanter*"]
 exclude = ["tests*", "spikes*"]
 
 [tool.setuptools.package-data]
-decanter = ["data/*.txt"]
+decanter = ["data/*.txt", "calib/reference_data/*.npz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
