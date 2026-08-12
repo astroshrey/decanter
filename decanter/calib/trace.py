@@ -35,7 +35,9 @@ from numpy.polynomial import chebyshev as _cheb
 from numpy.typing import NDArray
 from scipy.signal import argrelmax
 
+from decanter.calib.aperture import Aperture, ApertureSet
 from decanter.io import fits as _fits
+from decanter.io.apdb import FUNCTION_TYPE_CHEBYSHEV, ApertureEntry
 
 _REF_DIR = Path(__file__).parent / "reference_data"
 _REF_NPZ = {"WIDE": "wide_20171202.npz",
@@ -57,7 +59,28 @@ class TracedApertures:
 
     traces: dict[int, NDArray[np.float64]]   # {order: x(y), length n_rows, 1-indexed}
     centers: dict[int, float]                # {order: aperture center x at mid-row}
+    coeffs: dict[int, NDArray[np.float64]]   # {order: Chebyshev trace coefficients}
+    y_min: float
+    y_max: float
     n_rows: int
+
+    def to_aperture_set(self, low: float, high: float) -> ApertureSet:
+        """Build an :class:`ApertureSet` with the given aperture window.
+
+        Lets the traced apertures feed the same code paths that consume a
+        WARP aperture DB (apscatter, box/optimal extraction, masks).
+        """
+        aps = {}
+        for m, coef in self.coeffs.items():
+            entry = ApertureEntry(
+                order=m, center_x=0.0, center_y=self.n_rows / 2.0,
+                low=float(low), high=float(high),
+                function_type=FUNCTION_TYPE_CHEBYSHEV, poly_order=coef.size,
+                y_min=self.y_min, y_max=self.y_max,
+                coefficients=tuple(float(c) for c in coef),
+            )
+            aps[m] = Aperture(entry=entry, array_length=self.n_rows)
+        return ApertureSet(apertures=aps, array_length=self.n_rows)
 
 
 def _centroid(x: NDArray, y: NDArray, c_index: int, width: int = 2) -> float:
@@ -70,10 +93,16 @@ def _centroid(x: NDArray, y: NDArray, c_index: int, width: int = 2) -> float:
 
 
 def _cheb_fit(px: NDArray, py: NDArray, ymin: float, ymax: float, n_rows: int
-              ) -> NDArray[np.float64]:
-    """Sigma-clipped Chebyshev trace fit; returns x on rows 1..n_rows."""
+              ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Sigma-clipped Chebyshev trace fit.
+
+    Returns ``(trace_x, coeffs)`` where ``trace_x`` is x on rows 1..n_rows and
+    ``coeffs`` are the Chebyshev coefficients on ``y_norm = (2y-ymin-ymax)/
+    (ymax-ymin)`` (so ``chebval(y_norm, coeffs)`` reproduces the trace).
+    """
     keep = np.ones(px.size, bool)
     normy = (2 * py - ymin - ymax) / (ymax - ymin)
+    coef = _cheb.chebfit(normy, px, _CHEB_ORDER - 1)
     for _ in range(_CLIP_ITERS):
         coef = _cheb.chebfit(normy[keep], px[keep], _CHEB_ORDER - 1)
         resid = px - _cheb.chebval(normy, coef)
@@ -83,7 +112,7 @@ def _cheb_fit(px: NDArray, py: NDArray, ymin: float, ymax: float, n_rows: int
         keep = np.abs(resid - np.mean(resid[keep])) <= _CLIP_SIG * sd
     rows = np.arange(1, n_rows + 1, dtype=float)
     rnorm = (2 * rows - ymin - ymax) / (ymax - ymin)
-    return _cheb.chebval(rnorm, coef)
+    return _cheb.chebval(rnorm, coef), coef
 
 
 def trace_apertures(multihole_frame: Path | str | NDArray, mode: str,
@@ -145,6 +174,7 @@ def trace_apertures(multihole_frame: Path | str | NDArray, mode: str,
     ymin, ymax = float(_EDGE_LO / 10), float(n_rows - _EDGE_LO / 10)
     traces: dict[int, NDArray] = {}
     centers: dict[int, float] = {}
+    coeffs: dict[int, NDArray] = {}
     for m, (idx0, cen0) in ref_hole.items():
         holes = np.array(holes_per_order[m])
         px, py = [], []
@@ -174,9 +204,10 @@ def trace_apertures(multihole_frame: Path | str | NDArray, mode: str,
         px, py = np.array(px), np.array(py)
         if px.size < _CHEB_ORDER + 2:
             continue
-        traces[m] = _cheb_fit(px, py, ymin, ymax, n_rows)
+        traces[m], coeffs[m] = _cheb_fit(px, py, ymin, ymax, n_rows)
         centers[m] = float(cen0)
-    return TracedApertures(traces=traces, centers=centers, n_rows=n_rows)
+    return TracedApertures(traces=traces, centers=centers, coeffs=coeffs,
+                           y_min=ymin, y_max=ymax, n_rows=n_rows)
 
 
 def average_frames(paths: list[Path | str]) -> NDArray[np.float64]:
