@@ -62,6 +62,20 @@ def test_optimal_handles_negative_nod_star():
     assert abs(np.median(neg) + np.median(pos)) / flux < 0.02   # same magnitude
 
 
+def test_frozen_profile_matches_per_frame_on_clean_data():
+    """A frozen profile (from spatial_profile) gives the same result as the
+    per-frame profile on clean data, and is accepted via profile=."""
+    from decanter.extract.optimal_extract import spatial_profile
+    strip, trace, flux = _synthetic_strip()
+    offs, prof = spatial_profile(strip, trace, ap_low=-12.0, ap_high=12.0)
+    assert abs(prof.sum() - 1.0) < 1e-6                 # unit-sum profile
+    per_frame = optimal_extract(strip, trace, ap_low=-12.0, ap_high=12.0)
+    frozen = optimal_extract(strip, trace, ap_low=-12.0, ap_high=12.0,
+                             profile=(offs, prof))
+    # same profile source here -> essentially identical
+    assert np.nanmedian(np.abs(frozen - per_frame)) / flux < 1e-3
+
+
 def test_optimal_rejects_bad_aperture():
     strip, trace, _ = _synthetic_strip()
     try:

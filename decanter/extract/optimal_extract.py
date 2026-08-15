@@ -116,6 +116,26 @@ def _read_variance(
     return float(max(sigma * sigma, 1.0))
 
 
+def spatial_profile(
+    image: NDArray[np.floating],
+    trace_x: NDArray[np.floating],
+    *,
+    ap_low: float,
+    ap_high: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """The empirical, sign-corrected, unit-sum spatial profile of one strip.
+
+    Returns ``(offsets, profile)``. Median several out-of-transit frames'
+    profiles to build a high-SNR **frozen** profile for :func:`optimal_extract`
+    (its ``profile=`` argument), giving a repeatable time-series extraction.
+    """
+    img = np.asarray(image, float)
+    center = np.asarray(trace_x, float) - 1.0 + (ap_low + ap_high) / 2.0
+    half = (ap_high - ap_low) / 2.0
+    sign = _star_sign(img, center, half)
+    return _build_profile(img, center, half, sign)
+
+
 def optimal_extract(
     image: NDArray[np.floating],
     trace_x: NDArray[np.floating],
@@ -125,6 +145,7 @@ def optimal_extract(
     read_var: float | None = None,
     gain: float = 1.0,
     return_var: bool = False,
+    profile: tuple[NDArray[np.floating], NDArray[np.floating]] | None = None,
 ) -> NDArray[np.float32] | tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Optimally extract one rectified strip to a 1-D spectrum.
 
@@ -138,6 +159,12 @@ def optimal_extract(
             only the relative weighting matters).
         return_var: if True, also return the per-pixel variance of the
             optimal estimate (``1 / sum(P^2 / V)``) — useful for SNR.
+        profile: a ``(offsets, profile)`` pair to use as the spatial profile
+            instead of estimating it from this frame. Pass a **frozen** profile
+            (e.g. from :func:`spatial_profile` on an out-of-transit master) to
+            make a transit time series repeatable frame-to-frame — the per-frame
+            empirical profile otherwise injects frame-to-frame systematics that
+            can outweigh optimal's photon-noise gain in a differential signal.
 
     Returns:
         Float32 flux array of length ``n_y`` (rows whose window falls off the
@@ -151,8 +178,11 @@ def optimal_extract(
     if half <= 0:
         raise ValueError(f"ap_high ({ap_high}) must exceed ap_low ({ap_low})")
 
-    sign = _star_sign(img, center, half)
-    offs, prof = _build_profile(img, center, half, sign)
+    sign = _star_sign(img, center, half)   # per-frame sign (ABBA), for the model variance
+    if profile is not None:
+        offs, prof = np.asarray(profile[0], float), np.asarray(profile[1], float)
+    else:
+        offs, prof = _build_profile(img, center, half, sign)
     rv = _read_variance(img, center, half) if read_var is None else float(read_var)
 
     out = np.zeros(H, dtype=np.float32)

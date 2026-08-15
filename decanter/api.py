@@ -89,6 +89,7 @@ def reduce(
     mode: str = "warp",
     subtract_background: bool = False,
     extract: str = "box",
+    optimal_profile: dict[int, tuple] | None = None,
 ) -> Reduction:
     """Single-frame reduction of one WINERED object frame.
 
@@ -318,11 +319,12 @@ def reduce(
             trace_x = frame_ap.traces[m]
             ap_low, ap_high = frame_ap.ap_low, frame_ap.ap_high
         if extract == "optimal":
+            prof = optimal_profile.get(m) if optimal_profile else None
             obj_1d[m] = optimal_extract(strip_arr, trace_x,
-                                        ap_low=ap_low, ap_high=ap_high)
+                                        ap_low=ap_low, ap_high=ap_high, profile=prof)
             if m in strips_sky_arrays:
                 sky_1d[m] = optimal_extract(strips_sky_arrays[m], trace_x,
-                                            ap_low=ap_low, ap_high=ap_high)
+                                            ap_low=ap_low, ap_high=ap_high, profile=prof)
         else:
             obj_1d[m] = box_extract(strip_arr, trace_x, ap_low=ap_low, ap_high=ap_high,
                                     subtract_background=subtract_background)
