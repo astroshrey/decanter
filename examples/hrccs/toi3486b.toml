@@ -1,0 +1,47 @@
+output_dir = "hrccs_output/toi3486b"
+show_progress = true
+
+[input]
+decanter_dir = "../outputs/decanter_wavecal/toi3486b"
+
+[system]
+planet_name = "TOI-3486 b"
+observation_type = "transit"
+period_days = 2.21778105
+event_midpoint_bjd_tdb = 2459797.24218
+event_duration_hours = 1.717
+expected_kp_kms = 153.391
+ra_deg = 249.4432035
+dec_deg = -59.3051077
+stellar_rv_kms = 6.51189
+stellar_radius_rsun = 0.788
+planet_radius_rjup = 0.943
+planet_mass_mjup = 0.312
+equilibrium_temperature_k = 1190.0
+metallicity_dex = 0.283
+
+[atmosphere]
+species = ["H2O", "OH", "Fe"]
+cloud_top_pressure_bar = 0.03
+cache_dir = "~/.cache/decanter/hrccs"
+
+[reduction]
+# Notebook-compatible downstream analysis is the pipeline default.
+telluric_threshold = 0.90
+telluric_mask_scope = "signal"
+ccf_lsf_margin_widths = 3.0
+svd_components = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+[search]
+kp_step_kms = 2.0
+vsys_step_kms = 2.0
+local_kp_half_width_kms = 30.0
+local_vsys_half_width_kms = 15.0
+
+[injection]
+null_realizations = 5
+
+[plots]
+enabled = true
+orders_per_page = 5
+formats = ["pdf", "png"]

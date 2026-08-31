@@ -10,10 +10,14 @@ User-facing API:
         cross-frame waveshift (waveshift is relative across frames
         and meaningless for a single frame).
 
+    decanter.reduce_many(..., wavecal_config=None, workdir=None)
+        Multi-frame reduction with the original WARP-compatible relative
+        wavelength alignment. Passing a WavecalConfig optionally layers the
+        physical telluric/OH calibration on top.
+        Passing workdir writes only the completed, fully calibrated series.
+
     decanter.combine(...)
-        Multi-frame SNR-weighted stack. Currently a stub
-        (raises NotImplementedError). For transit-style per-frame
-        analysis, loop :func:`reduce` over your frame list.
+        Multi-frame SNR-weighted stack of aligned reductions.
 
     decanter.Calibration.from_dir(reduc_root)
         Auto-discover all calibration paths from a WARP-style
@@ -26,9 +30,16 @@ See ``CLAUDE.md`` / ``HANDOFF.md`` for architecture notes and
 __version__ = "0.0.1"
 
 from decanter._reduction import Intermediates, OrderSpectrum, Reduction
-from decanter.api import TransitSeries, combine, reduce, reduce_many
+from decanter.api import TransitSeries, calibrate_wavelengths, combine, reduce, reduce_many
 from decanter.calib import Calibration, CalibrationMismatch, InstrumentConfig
 from decanter.config import Config
+from decanter.serval import (
+    RVStabilityResult,
+    TransitEphemeris,
+    run_serval_rv_stability,
+    run_serval_rv_stability_directory,
+)
+from decanter.wavecal import WavecalConfig, WavecalSolution
 
 __all__ = [
     "Calibration",
@@ -38,8 +49,15 @@ __all__ = [
     "Intermediates",
     "OrderSpectrum",
     "Reduction",
+    "RVStabilityResult",
+    "TransitEphemeris",
     "TransitSeries",
+    "WavecalConfig",
+    "WavecalSolution",
+    "calibrate_wavelengths",
     "combine",
     "reduce",
     "reduce_many",
+    "run_serval_rv_stability",
+    "run_serval_rv_stability_directory",
 ]

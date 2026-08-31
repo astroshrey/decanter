@@ -1,0 +1,47 @@
+output_dir = "hrccs_output/toi2109b"
+show_progress = true
+
+[input]
+decanter_dir = "../outputs/decanter_wavecal/toi2109b"
+
+[system]
+planet_name = "TOI-2109 b"
+observation_type = "transit"
+period_days = 0.67247414
+event_midpoint_bjd_tdb = 2459378.459370
+event_duration_hours = 1.801
+expected_kp_kms = 273.526
+ra_deg = 253.1862917
+dec_deg = 16.5812222
+stellar_rv_kms = -18.64
+stellar_radius_rsun = 1.698
+planet_radius_rjup = 1.347
+planet_mass_mjup = 5.02
+equilibrium_temperature_k = 3646.0
+metallicity_dex = 0.068
+
+[atmosphere]
+species = ["H2O", "Si", "Fe", "Mg", "Ca", "V"]
+cloud_top_pressure_bar = 0.03
+cache_dir = "~/.cache/decanter/hrccs"
+
+[reduction]
+# Notebook-compatible downstream analysis is the pipeline default.
+telluric_threshold = 0.90
+telluric_mask_scope = "signal"
+ccf_lsf_margin_widths = 3.0
+svd_components = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+[search]
+kp_step_kms = 2.0
+vsys_step_kms = 2.0
+local_kp_half_width_kms = 30.0
+local_vsys_half_width_kms = 15.0
+
+[injection]
+null_realizations = 5
+
+[plots]
+enabled = true
+orders_per_page = 5
+formats = ["pdf", "png"]

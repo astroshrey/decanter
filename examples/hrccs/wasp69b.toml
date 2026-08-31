@@ -1,0 +1,47 @@
+output_dir = "hrccs_output/wasp69b_no_mask"
+show_progress = true
+
+[input]
+decanter_dir = "../outputs/decanter_iterative/wasp69b"
+
+[system]
+planet_name = "WASP-69 b"
+observation_type = "transit"
+period_days = 3.8681382
+event_midpoint_bjd_tdb = 2455748.834240741
+event_duration_hours = 2.2296
+expected_kp_kms = 127.055
+ra_deg = 315.0242916667
+dec_deg = -5.0963611111
+stellar_rv_kms = -9.62826
+stellar_radius_rsun = 0.813
+planet_radius_rjup = 1.057
+planet_mass_mjup = 0.26
+equilibrium_temperature_k = 963.0
+metallicity_dex = 0.10
+
+[atmosphere]
+species = ["H2O", "OH", "Fe"]
+cloud_top_pressure_bar = 0.03
+cache_dir = "~/.cache/decanter/hrccs"
+
+[reduction]
+# Notebook-compatible downstream analysis is the pipeline default.
+telluric_threshold = 0.90
+telluric_mask_scope = "signal"
+ccf_lsf_margin_widths = 3.0
+svd_components = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+[search]
+kp_step_kms = 2.0
+vsys_step_kms = 2.0
+local_kp_half_width_kms = 30.0
+local_vsys_half_width_kms = 15.0
+
+[injection]
+null_realizations = 5
+
+[plots]
+enabled = true
+orders_per_page = 5
+formats = ["pdf", "png"]

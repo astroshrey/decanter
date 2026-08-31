@@ -1,0 +1,47 @@
+output_dir = "hrccs_output/wasp193b"
+show_progress = true
+
+[input]
+decanter_dir = "../outputs/decanter_final/wasp193b"
+
+[system]
+# Yee et al. (2025, AJ 169, 225)
+planet_name = "WASP-193 b"
+observation_type = "transit"
+period_days = 6.2463475
+event_midpoint_bjd_tdb = 2459243.31080
+event_duration_hours = 4.2559
+expected_kp_kms = 116.333
+ra_deg = 164.34937
+dec_deg = -29.99714
+stellar_rv_kms = -2.95
+stellar_radius_rsun = 1.213
+planet_radius_rjup = 1.319
+planet_mass_mjup = 0.112
+equilibrium_temperature_k = 1250.0
+metallicity_dex = -0.108
+
+[atmosphere]
+species = ["H2O", "CrH", "FeH"]
+cloud_top_pressure_bar = 0.03
+cache_dir = "~/.cache/decanter/hrccs"
+
+[reduction]
+telluric_threshold = 0.90
+telluric_mask_scope = "signal"
+ccf_lsf_margin_widths = 3.0
+svd_components = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+[search]
+kp_step_kms = 2.0
+vsys_step_kms = 2.0
+local_kp_half_width_kms = 30.0
+local_vsys_half_width_kms = 15.0
+
+[injection]
+null_realizations = 5
+
+[plots]
+enabled = true
+orders_per_page = 5
+formats = ["pdf", "png"]

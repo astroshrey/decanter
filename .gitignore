@@ -63,5 +63,13 @@ settings.local.json
 # Sphinx build output
 docs/_build/
 
+# Local wavecal products and rendered PDF QA
+/output/
+/tmp/
+
+# Local standalone analysis utilities and generated HRCCS products
+/scripts/
+/hrccs_output/
+
 # bundled per-mode aperture reference templates (small, needed at runtime)
 !decanter/calib/reference_data/*.npz

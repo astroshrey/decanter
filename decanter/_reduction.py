@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 from astropy.io import fits as _astrofits
 from numpy.typing import NDArray
@@ -89,6 +89,12 @@ class Reduction:
             ``config.flag_skyemission`` is False.
         intermediates: per-stage diagnostic arrays; non-trivial only
             when ``save_intermediates=True`` was passed.
+        meta: observation metadata carried from the raw object frame
+            (see :data:`decanter.io.headers.FRAME_META_KEYS`), plus
+            ``OBJFRAME``/``SKYFRAME`` and the applied ``WAVSHIFT``.
+            :meth:`write_to` writes it into every output spectrum's header,
+            so mid-times, pointing and instrument configuration are readable
+            off the reduced products.
     """
 
     obj_name: str
@@ -97,6 +103,7 @@ class Reduction:
     obj: Mapping[tuple[float, int], OrderSpectrum]
     sky: Mapping[tuple[float, int], OrderSpectrum] | None = None
     intermediates: Intermediates = field(default_factory=Intermediates)
+    meta: dict[str, Any] = field(default_factory=dict)
 
     @property
     def orders(self) -> tuple[int, ...]:
@@ -130,6 +137,13 @@ class Reduction:
             h["CDELT1"] = (spec.cdelt1, "Wavelength step per pixel")
             h["CRPIX1"] = (spec.crpix1, "Reference pixel along dispersion")
             h["CTYPE1"] = ("LINEAR", "Wavelength axis")
+            h["ECHORDER"] = (spec.order, "Echelle order number")
+            h["FSRCUT"] = (spec.fsr_cut, "Free-spectral-range cut fraction")
+            for key, value in self.meta.items():
+                try:
+                    h[key] = value
+                except (ValueError, KeyError):
+                    continue
             return h
 
         # Final obj spectra
