@@ -103,7 +103,7 @@ def run(config):
     prepared = np.asarray(flux, dtype=float).copy()
     atmosphere = replace(config.atmosphere, resolving_power=resolving_power)
     factory = TemplateFactory(config.system, atmosphere, instmode=cube.instmode)
-    from tqdm.auto import tqdm
+    from ._progress import tqdm
 
     results = []
     species_bar = tqdm(

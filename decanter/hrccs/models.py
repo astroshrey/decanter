@@ -56,7 +56,7 @@ def _download(url: str, path: Path) -> Path:
         return path
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".part")
-    from tqdm.auto import tqdm
+    from ._progress import tqdm
 
     terminal = sys.__stderr__ or sys.stderr
     progress = tqdm(
@@ -493,7 +493,7 @@ class TemplateFactory:
         starts = list(range(0, wave.size, chunk_points))
         if len(starts) > 1 and wave.size - starts[-1] < 2:
             starts.pop()
-        from tqdm.auto import tqdm
+        from ._progress import tqdm
         pieces = []
         chunk_bar = tqdm(
             starts, desc=f"{species} wide-model chunks", unit="chunk", leave=False,
@@ -675,7 +675,7 @@ class TemplateFactory:
                 path = _exomol_path(species, exomol_root, self.config.exomol_datasets)
                 definition = path / f"{path.parent.name}__{path.name}.def"
                 if not definition.exists():
-                    from tqdm.auto import tqdm
+                    from ._progress import tqdm
                     tqdm.write(
                         f"Downloading ExoMol line data for {species} -> {path}",
                         file=sys.__stderr__ or sys.stderr,
@@ -699,7 +699,7 @@ class TemplateFactory:
                 path = hitran_root / database_path_hitran12(species)
                 cached_tables = tuple(path.parent.glob("*.hdf5")) if path.parent.exists() else ()
                 if not path.exists() and not cached_tables:
-                    from tqdm.auto import tqdm
+                    from ._progress import tqdm
                     tqdm.write(
                         f"Downloading HITRAN line data for {species} via ExoJAX -> {path}",
                         file=sys.__stderr__ or sys.stderr,

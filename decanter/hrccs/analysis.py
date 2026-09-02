@@ -241,7 +241,7 @@ def run_species(species, prepared, wavelength_um, raw_templates, mask, phase, be
                 injection_scale, seed, null_realizations, *,
                 wide_wavelength_um=None, wide_template=None,
                 velocity_basis=None, baseline_mask=None, show_progress=True):
-    from tqdm.auto import tqdm
+    from ._progress import tqdm
 
     progress = tqdm(
         total=len(counts) + 1 + null_realizations,
