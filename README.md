@@ -11,7 +11,8 @@ bit-identical to WARP's in all three instrument modes (HIRES-Y, HIRES-J, WIDE).
 ## Install
 
 ```bash
-pip install -e .        # requires numpy, scipy, astropy
+pip install -e .            # requires numpy, scipy, astropy
+pip install -e '.[mlx]'     # optional, Apple silicon: GPU rectification, same output
 ```
 
 ## Quickstart
@@ -48,7 +49,8 @@ Compare two such trees file by file with
 
 ## Modes
 
-- `mode="warp"` (default): the WARP clone, vectorised and calibration-cached.
+- `mode="warp"` (default): the WARP clone, vectorised and calibration-cached,
+  with the rectification on the Apple GPU when MLX is installed.
 - `mode="warp-reference"`: the slower stage-by-stage port it is checked against.
 
 Both match WARP bit for bit, except for WARP's own uninitialised last pixel in
