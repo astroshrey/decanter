@@ -8,6 +8,8 @@ Reduction
 
 .. autofunction:: decanter.reduce_many
 
+.. autofunction:: decanter.reduce_to_warp_tree
+
 .. autofunction:: decanter.calibrate_wavelengths
 
 .. autofunction:: decanter.combine
