@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decanter"
-version = "0.0.1"
+version = "1.0.0"
 description = "Pure-Python reduction pipeline for WINERED echelle spectra."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ license = { text = "MIT" }
 authors = [{ name = "Shreyas Vissapragada", email = "svissa96@gmail.com" }]
 keywords = ["spectroscopy", "echelle", "astronomy", "data-reduction", "winered"]
 classifiers = [
-    "Development Status :: 1 - Planning",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3 :: Only",
