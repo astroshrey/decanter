@@ -10,6 +10,7 @@ observation about the Metal compiler, tested here too.
 from __future__ import annotations
 
 import dataclasses
+import platform
 
 import numpy as np
 import pytest
@@ -305,6 +306,16 @@ def test_dispcor_edges_fast_identical():
 
 # --- s02 CR mask: WARP factor map, vectorised (synthetic) ------------------------
 
+# The emulation reproduces NumPy's float32 reductions as built for arm64 (the
+# machine WARP's references were made on, docs/BITEXACT.md); x86 NumPy builds
+# vectorise these reductions differently.
+_ARM64_ONLY = pytest.mark.skipif(
+    platform.machine().lower() not in ("arm64", "aarch64"),
+    reason="bit-exact against arm64 NumPy's float32 reductions",
+)
+
+
+@_ARM64_ONLY
 def test_segment_std_matches_numpy():
     """Segmented float32 np.std / np.mean (pairwise sums, 8192-element reduce
     chunks) equal NumPy's own, element for element."""

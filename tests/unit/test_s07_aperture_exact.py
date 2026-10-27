@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import platform
 import types
 import warnings
 from pathlib import Path
@@ -30,6 +31,16 @@ def _random_problem(rng):
     return (y, x, float(x[np.argmax(y)]))
 
 
+# The one-pass binning reproduces NumPy's np.median as built for arm64 (the
+# machine WARP's references were made on, docs/BITEXACT.md); x86 NumPy builds
+# vectorise it differently.
+_ARM64_ONLY = pytest.mark.skipif(
+    platform.machine().lower() not in ("arm64", "aarch64"),
+    reason="bit-exact against arm64 NumPy's np.median",
+)
+
+
+@_ARM64_ONLY
 def test_bin_medians_match_warp_masks() -> None:
     """The one-pass binning equals WARP's 100 boolean-mask np.median calls."""
     rng = np.random.default_rng(3)
@@ -174,6 +185,7 @@ def test_scipy1141_refs_free_apdb_bitexact(ref: str, frame: int, monkeypatch) ->
     """References made by WARP in this venv (scipy 1.14.1): the default (the
     installed scipy) gives WARP's fitted floats; c1153 gives the same DB tokens."""
     import scipy
+
     from decanter.utils.psf import default_warp_leastsq
     red = _REFS / ref
     if not red.is_dir():

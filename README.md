@@ -99,7 +99,9 @@ output is bit-identical: by construction on the CPU path
 (`DECANTER_FAST_BACKEND=numpy`), and on the GPU path apart from float32
 subnormals in rectified-strip pixels the extraction never reads (visible only
 with `save_intermediates=True`). Both are bit-identical to WARP except WARP's
-documented uninitialised-memory tail pixels. `save_intermediates=True`,
+documented uninitialised-memory tail pixels. Bit-identity is defined on Apple
+silicon (arm64), where the WARP references were made; NumPy and IRAF builds
+on x86 round some float32 reductions differently. `save_intermediates=True`,
 `extract="optimal"` and `subtract_background=True` work in the default mode
 (they rectify whole strips). See [docs/VECTORISED.md](docs/VECTORISED.md) for the
 implementation, what is verified and timings, and
