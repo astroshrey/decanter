@@ -40,6 +40,11 @@ dev = [
 mlx = [
     "mlx>=0.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
+# decanter.wavecal: the OH + telluric physical wavelength calibration.
+wavecal = [
+    "jax>=0.4",
+    "jaxlib>=0.4",
+]
 docs = [
     "sphinx>=7",
     "sphinx-rtd-theme>=2",

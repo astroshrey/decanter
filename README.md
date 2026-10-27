@@ -13,6 +13,7 @@ bit-identical to WARP's in all three instrument modes (HIRES-Y, HIRES-J, WIDE).
 ```bash
 pip install -e .            # requires numpy, scipy, astropy
 pip install -e '.[mlx]'     # optional, Apple silicon: GPU rectification, same output
+pip install -e '.[wavecal]' # optional: physical wavelength calibration (JAX)
 ```
 
 ## Quickstart
@@ -63,3 +64,23 @@ Both match WARP bit for bit, except for WARP's own uninitialised last pixel in
 some FSR cuts. Bit-identity is defined on Apple silicon (arm64), where the
 WARP references were made. Details: [docs/BITEXACT.md](docs/BITEXACT.md) and
 [docs/VECTORISED.md](docs/VECTORISED.md).
+
+## Physical wavelength calibration
+
+`decanter.wavecal` measures, frame by frame, where the atmosphere puts its
+lines on the ThAr scale: OH airglow in the sky spectra (the instrument) and
+telluric H2O in the object spectra (the starlight). It works on a night
+series, a single frame, or sparse RV epochs, and resamples only once.
+
+```python
+import decanter.wavecal as wc
+
+series = decanter.reduce_many(frame_pairs, calib)
+sol = wc.anchor_reduction(series, calib)
+sol.z_star, sol.z_star_err                  # km/s per object frame
+u = sol.labels(163, lam, kind="star")       # ln(lambda_true / lambda_label)
+flux = wc.export_resample(flux, lam, u, lam)
+```
+
+A WARP reduction works too: `wc.anchor(wc.load_warp_night("reductions/TOI2109"))`.
+The method and its validation are in the `decanter.wavecal.model` docstring.
