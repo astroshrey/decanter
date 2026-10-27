@@ -11,9 +11,7 @@ bit-identical to WARP's in all three instrument modes (HIRES-Y, HIRES-J, WIDE).
 ## Install
 
 ```bash
-pip install -e .              # requires numpy, scipy, astropy
-pip install -e '.[mlx]'       # optional: Apple-GPU rectification (same output)
-pip install -e '.[wavecal]'   # optional: physical wavelength calibration
+pip install -e .        # requires numpy, scipy, astropy
 ```
 
 ## Quickstart
@@ -57,11 +55,3 @@ Both match WARP bit for bit, except for WARP's own uninitialised last pixel in
 some FSR cuts. Bit-identity is defined on Apple silicon (arm64), where the
 WARP references were made. Details: [docs/BITEXACT.md](docs/BITEXACT.md) and
 [docs/VECTORISED.md](docs/VECTORISED.md).
-
-## Also included
-
-- **Physical wavelength calibration** against telluric and OH lines:
-  `decanter.reduce_many(pairs, calib, wavecal_config=decanter.WavecalConfig())`,
-  or `python reduce.py --help` for the command line.
-- **RV stability check** with SERVAL: `python reduce.py ... --serval-rv`.
-- **HRCCS cross-correlation**: `decanter-hrccs examples/hrccs/wasp69b.toml`.

@@ -26,7 +26,6 @@ dependencies = [
     "scipy>=1.10",
     "astropy>=5.3",
     "matplotlib>=3.7",
-    "tomli>=2; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -36,32 +35,6 @@ dev = [
     "ruff>=0.1",
     "mypy>=1.5",
 ]
-jax = [
-    "jax>=0.4",
-    "jaxlib>=0.4",
-]
-wavecal = [
-    "jax>=0.4",
-    "jaxlib>=0.4",
-    "optax>=0.2",
-    "exojax>=2.2",
-    "radis>=0.16",
-    "h5py>=3.8",
-]
-hrccs = [
-    "astroquery>=0.4.7",
-    "tqdm>=4.66",
-    "jax>=0.4",
-    "jaxlib>=0.4",
-    "exojax>=2.2",
-    "radis>=0.16",
-    "pyfastchem>=3.1",
-]
-# mode="warp" runs its rectification on the Apple GPU when mlx is installed
-# (NumPy otherwise; the output bits are the same).
-mlx = [
-    "mlx>=0.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
-]
 docs = [
     "sphinx>=7",
     "sphinx-rtd-theme>=2",
@@ -69,9 +42,6 @@ docs = [
 
 [project.urls]
 Repository = "https://github.com/astroshrey/decanter"
-
-[project.scripts]
-decanter-hrccs = "decanter.hrccs.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["decanter*"]
