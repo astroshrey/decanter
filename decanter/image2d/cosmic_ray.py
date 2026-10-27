@@ -59,6 +59,7 @@ def cr_mask(
     ndr_obj: int,
     ndr_sky: int,
     config: Config,
+    stats: dict | None = None,
 ) -> np.ndarray:
     """Pure task function: cosmic-ray mask for one (obj, sky) frame pair.
 
@@ -82,6 +83,9 @@ def cr_mask(
         varatio=config.CR_var_ratio, slitposratio=config.CR_slitpos_ratio,
         fixsigma=config.CR_fix_sigma,
     )
+    if stats is not None:
+        stats["pixnum"] = result.n_cosmic_rays
+        stats["sigthres"] = result.final_threshold
     return result.mask
 
 

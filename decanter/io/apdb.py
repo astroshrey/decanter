@@ -86,6 +86,19 @@ class ApertureEntry:
     y_max: float
     coefficients: tuple[float, ...]
     background_sample: str = "INDEF"
+    # Verbatim database tokens (for bit-exact REAL parsing with IRAF ctod):
+    # center/low/high are (axis1, axis2) string pairs; curve is the full
+    # ``curve`` block (type, order, xmin, xmax, coefficients...).
+    raw_center: tuple[str, str] | None = None
+    raw_low: tuple[str, str] | None = None
+    raw_high: tuple[str, str] | None = None
+    raw_curve: tuple[str, ...] | None = None
+    # The ``background`` section as ``((field, value text), ...)`` (``xmin``,
+    # ``xmax``, ``function``, ``order``, ``sample``, ``naverage``,
+    # ``niterate``, ``low_reject``, ``high_reject``, ``grow``), what
+    # ``ap_dbread`` loads into the aperture's ICFIT (apdb.x:225-238); None
+    # when the record has no background section.
+    raw_background: tuple[tuple[str, str], ...] | None = None
 
 
 def parse(path: Path | str) -> dict[int, ApertureEntry]:
@@ -106,7 +119,11 @@ def parse(path: Path | str) -> dict[int, ApertureEntry]:
         ValueError: if a block has malformed ``curve``, ``center``, ``low``,
             ``high``, or coefficient data.
     """
-    text = Path(path).read_text()
+    return parse_text(Path(path).read_text())
+
+
+def parse_text(text: str) -> dict[int, ApertureEntry]:
+    """:func:`parse` for database text already in memory."""
     lines = text.splitlines()
 
     entries: dict[int, ApertureEntry] = {}
@@ -141,17 +158,36 @@ def _parse_block(block: list[str]) -> ApertureEntry:
     y_min: float | None = None
     y_max: float | None = None
     coefficients: tuple[float, ...] | None = None
+    raw_center = raw_low = raw_high = raw_curve = None
+    raw_background: list[tuple[str, str]] | None = None
+    _bg_fields = ("xmin", "xmax", "function", "order", "sample", "naverage", "niterate",
+                  "low_reject", "high_reject", "grow")
 
     i = 0
     while i < len(block):
         stripped = block[i].lstrip()
+        if stripped.split() == ["background"]:
+            # dtgstr/dtgetr: the first line of the record whose first word
+            # is the field; the value is the rest of the line, leading
+            # whitespace stripped (pkg/xtools/dttext.x:311-345).
+            raw_background = []
+            for ln in block[i + 1:]:
+                toks = ln.split(None, 1)
+                if not toks or toks[0] not in _bg_fields:
+                    break
+                raw_background.append((toks[0], toks[1].strip() if len(toks) > 1 else ""))
         if stripped.startswith("center"):
             parts = stripped.split()
             center_x = float(parts[1])
             center_y = float(parts[2])
+            raw_center = (parts[1], parts[2])
             # Next two lines are "low" and "high" per WARP's parser convention.
-            low = float(block[i + 1].split()[1])
-            high = float(block[i + 2].split()[1])
+            lo_parts = block[i + 1].split()
+            hi_parts = block[i + 2].split()
+            low = float(lo_parts[1])
+            high = float(hi_parts[1])
+            raw_low = (lo_parts[1], lo_parts[2] if len(lo_parts) > 2 else lo_parts[1])
+            raw_high = (hi_parts[1], hi_parts[2] if len(hi_parts) > 2 else hi_parts[1])
         elif stripped.startswith("sample"):
             # Only the *first* "sample" we see is the background sample
             # (inside the background block). The curve sub-block doesn't
@@ -165,6 +201,7 @@ def _parse_block(block: list[str]) -> ApertureEntry:
             #   ftype, yorder, ymin, ymax, then yorder coefficients.
             #   curve_count == 4 + yorder.
             curve_lines = block[i + 1: i + 1 + curve_count]
+            raw_curve = tuple(line.split()[0] for line in curve_lines)
             if len(curve_lines) != curve_count:
                 raise ValueError(
                     f"order {order}: expected {curve_count} curve lines, got {len(curve_lines)}"
@@ -197,4 +234,9 @@ def _parse_block(block: list[str]) -> ApertureEntry:
         y_max=y_max,
         coefficients=coefficients,
         background_sample=background_sample,
+        raw_center=raw_center,
+        raw_low=raw_low,
+        raw_high=raw_high,
+        raw_curve=raw_curve,
+        raw_background=None if raw_background is None else tuple(raw_background),
     )

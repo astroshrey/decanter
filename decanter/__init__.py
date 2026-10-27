@@ -19,9 +19,15 @@ User-facing API:
     decanter.combine(...)
         Multi-frame SNR-weighted stack of aligned reductions.
 
+    decanter.reduce_to_warp_tree(listfile, raw_dir, calib, dest_dir, ...)
+        Reduce a whole night/listfile WARP's way (frame numbering, WARP-exact
+        cross-frame waveshift) and write WARP's on-disk layout, so every
+        downstream consumer of ``reductions/<testname>/`` works unchanged.
+
     decanter.Calibration.from_dir(reduc_root)
-        Auto-discover all calibration paths from a WARP-style
-        ``calibration_data/`` directory.
+        Auto-discover all calibration paths from a calibration set or a
+        WARP reduction root (a root also loads frame NO1's aperture DBs,
+        which lock extraction to NO1's trace; it warns when it does).
 
 See ``CLAUDE.md`` / ``HANDOFF.md`` for architecture notes and
 ``PLAN.md`` for the Phase-1 design.
@@ -39,6 +45,7 @@ from decanter.serval import (
     run_serval_rv_stability,
     run_serval_rv_stability_directory,
 )
+from decanter.warptree import WarpTree, reduce_to_warp_tree
 from decanter.wavecal import WavecalConfig, WavecalSolution
 
 __all__ = [
@@ -52,12 +59,14 @@ __all__ = [
     "RVStabilityResult",
     "TransitEphemeris",
     "TransitSeries",
+    "WarpTree",
     "WavecalConfig",
     "WavecalSolution",
     "calibrate_wavelengths",
     "combine",
     "reduce",
     "reduce_many",
+    "reduce_to_warp_tree",
     "run_serval_rv_stability",
     "run_serval_rv_stability_directory",
 ]

@@ -1,7 +1,9 @@
 """Iterative-reject 1-D polynomial fits — a NumPy port of IRAF's icfit.
 
-Used by s03 (apscatter), s14 (continuum), and any other stage that
-needs ``iraf.icfit``-style fitting: fit a low-order Legendre or
+Note: this port does not reproduce clang's fused multiply-adds, so it is
+not bit-exact.  s03 (apscatter) now uses the bit-exact batched kernel
+:mod:`decanter.utils.icfit_exact`; this module remains for icfit-style
+fitting where float32-ULP parity is not required: fit a low-order Legendre or
 Chebyshev polynomial, iteratively reject points that deviate beyond
 ``low_reject`` / ``high_reject`` σ from the residuals, refit, repeat
 until either no points are rejected or ``niterate`` iterations elapse.

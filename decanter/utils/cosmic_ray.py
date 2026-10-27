@@ -13,11 +13,16 @@ Algorithm summary (Hamano 2024 §5.2 + ``warp/badpixmask.py``):
 2. Build a noise model frame :math:`N(x, y) = \\sqrt{g\\,\\bar{S} + r_1^2 + r_2^2} / g`
    from the local median of the *summed* raw frames (where r₁, r₂ are
    the read-noise values for the two NDR settings).
-3. For each (echelle order × y-tile × slit-bin) tile compute the
-   per-tile standard deviation via 3 iterations of sigma clipping; the
-   max over slit-bins per (order, y-tile) becomes a "factor" multiplier
-   applied to the noise floor.
-4. Detect CRs where ``|diff residual| > sigThres × noise × factor`` AND
+3. For each (echelle order, y window) WARP measures 28 slit bins
+   ``(r_s, r_s + 2]`` for ``r_s = -28 .. 26`` (the edge strips (-30, -28]
+   and (28, 30) are never measured): float32 ``np.std`` of the residuals,
+   re-clipped up to 3 times at ``|v| < 5 * std`` (strict, from the full bin;
+   stop when the std is unchanged, ``==``), and ``np.average`` of the noise.
+   ``factor = max(1., max(stds) / max(noises))`` with Python's builtin
+   ``max``: an empty bin gives NaN, a NaN in the first bin makes the factor
+   1, a later NaN is skipped. Ported line for line (selections in WARP's C
+   order, so the float32 reductions are the same).
+4. Detect CRs where ``|diff residual| > (sigThres × noise) × factor`` (float32) AND
    the spike sign in the diff agrees with the sign in the right raw frame
    (positive diff + positive raw₁ = CR in obj; negative diff + positive
    raw₂ = CR in sky).
@@ -32,15 +37,15 @@ NDR-dependent noise model, A/B nod position cross-check).
 
 from __future__ import annotations
 
+import math
+import warnings
 from dataclasses import dataclass
-from typing import Literal
 
 import numpy as np
 import scipy.ndimage
 from numpy.typing import NDArray
 
 from decanter.utils.median_filter import median_filter
-from decanter.utils.sigma_clip import per_segment_clip
 
 # WARP-pinned constants (warp/badpixmask.py:140-143).
 _GAIN_E_PER_ADU: float = 2.27
@@ -64,10 +69,11 @@ class CosmicRayResult:
     """Total number of pixels flagged after the outer loop converged."""
 
     final_threshold: float
-    """``sigThres`` value at the iteration that converged (≥ ``threshold``)."""
+    """WARP's returned ``sigThres``: the last pass's threshold, or one ``sigstep``
+    past ``max_sigma`` when the last pass still looked clustered."""
 
     iterations: int
-    """Number of outer-loop iterations performed (1 if the first pass converged)."""
+    """Number of detection passes run (1 if the first pass converged)."""
 
 
 def _make_slant_footprint(angle_deg: float = 85.0, window: int = 10) -> NDArray[np.int_]:
@@ -86,7 +92,7 @@ def _make_slant_footprint(angle_deg: float = 85.0, window: int = 10) -> NDArray[
     xx, yy = np.meshgrid(x, y)
     xcen = ycen = (ksize - 1) / 2.0
     width = 1.0
-    angle_tan = np.tan(np.deg2rad(angle_deg))
+    angle_tan = math.tan(angle_deg / 180. * math.pi)    # as WARP writes it
     if angle_deg <= 45.0:
         f = (yy - ycen) - angle_tan * (xx - xcen)
     else:
@@ -189,173 +195,174 @@ def detect_cosmic_rays(
     diff_resid = _median_filter_pair(diff, medsize)
     raw1_resid = _median_filter_pair(raw1, medsize)
     raw2_resid = _median_filter_pair(raw2, medsize)
-    diff_sign_positive = diff_resid > 0
-    raw1_sign_positive = raw1_resid > 0
-    raw2_sign_positive = raw2_resid > 0
-    diff_resid_abs = np.abs(diff_resid)
+    diff_resid_abs = np.absolute(diff_resid)
 
-    # --- Step 2: noise model from the slant-smoothed summed raw frames.
-    slant = _make_slant_footprint(angle_deg=85.0, window=10)
-    summed = np.abs(raw1.astype(np.float64) + raw2.astype(np.float64))
-    smoothed = scipy.ndimage.median_filter(summed, footprint=slant, mode="reflect")
-    read_var = _READ_NOISE_BY_NDR[ndr1] ** 2 + _READ_NOISE_BY_NDR[ndr2] ** 2
-    noise = np.sqrt(smoothed * gain + read_var) / gain
+    # --- Step 2: noise model from the slant-smoothed summed raw frames, in the
+    # raw frames' own dtype (float32 for WINERED FITS), evaluated left to right
+    # as WARP writes it (badpixmask.py:167-169).
+    noise = warp_noise_image(raw1, raw2, ndr1, ndr2, gain=gain)
 
-    # --- Step 3: per-(order, y-tile, slit-bin) factor map.
+    # --- Step 3: per-(order, y-window) factor, WARP's loop verbatim
+    # (badpixmask.py:186-235). Each (order, window, slit-bin) selection is the
+    # same pixels in the same (C) order as WARP's boolean index, so np.std /
+    # np.average see the same float32 arrays.
+    windows = warp_y_windows(array_length, ystep)
     H, W = diff_resid.shape
-    y_grid, _ = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
-    n_orders = len(echelle_orders)
-    n_slit_bins = int(np.floor((xlim2 - xlim1) / bins))
+    flat_apmask = np.asarray(apmask).ravel()
+    flat_sc = np.asarray(slitcoord).ravel()
+    flat_d = diff_resid.ravel()
+    flat_n = noise.ravel()
+    order_pix: list[tuple[NDArray, list[slice]]] = []
+    factorlist: list[list[object]] = []
+    for m in echelle_orders:
+        idx = np.flatnonzero(flat_apmask == m)          # C order
+        rows = idx // W
+        # Yarray > y_s & Yarray <= y_e on the (sorted) rows -> one slice each.
+        wsl = [slice(int(np.searchsorted(rows, ys, side="right")),
+                     int(np.searchsorted(rows, ye, side="right")))
+               for ys, ye in windows]
+        order_pix.append((idx, wsl))
+        sc_m, d_m, n_m = flat_sc[idx], flat_d[idx], flat_n[idx]
+        factors: list[object] = []
+        for sl in wsl:
+            factors.append(_warp_window_factor(
+                sc_m[sl], d_m[sl], n_m[sl], xlim1=xlim1, xlim2=xlim2, bins=bins,
+                clipsigma=clipsigma, iteration=iteration))
+        factorlist.append(factors)
 
-    # WARP's tile boundaries (badpixmask.py:196-235):
-    #   y_s, y_e = 0, ystep
-    #   while y_e < arrayLength:
-    #       process tile (y_s, y_e]
-    #       y_s += ystep; y_e += ystep
-    #       if arrayLength - y_e < ystep: y_e = arrayLength
-    # So tile k=0..K-1 is processed where K is the largest integer with
-    # (k+1)*ystep < arrayLength STRICTLY. The clamp pushes y_e to
-    # arrayLength after the LAST processed iteration, blocking iter K+1.
-    # `(Yarray > y_s) & (Yarray <= y_e)` with Yarray 0-indexed means
-    # tile k covers Y ∈ {k*ystep + 1, ..., (k+1)*ystep}. Y=0 is
-    # never in any tile; the bottom partial (Y > K*ystep) is also not.
-    #
-    # For H=2048, ystep=100: K=19 tiles covering Y∈{1..1900}; Y=0 and
-    # Y∈{1901..2047} are NOT in any tile (factor=1 there).
-    n_y_tiles = (H - ystep) // ystep
-    # Tile assignment: floor((Y - 1) / ystep). Y=0 maps to -1 (invalid);
-    # Y >= n_y_tiles * ystep + 1 maps to >= n_y_tiles (invalid).
-    y_tile_map = (y_grid - 1) // ystep
-    y_tile_valid = (y_grid >= 1) & (y_tile_map < n_y_tiles)
-
-    order_to_idx = {m: i for i, m in enumerate(echelle_orders)}
-    order_idx_map = np.full(apmask.shape, -1, dtype=np.int64)
-    for m, idx in order_to_idx.items():
-        order_idx_map[apmask == m] = idx
-    slit_bin_map = np.floor((slitcoord - xlim1) / bins).astype(np.int64)
-    in_aperture = order_idx_map >= 0
-    in_slit_range = (slit_bin_map >= 0) & (slit_bin_map < n_slit_bins)
-    valid = in_aperture & in_slit_range & y_tile_valid
-    tile_id = np.full(apmask.shape, -1, dtype=np.int64)
-    n_tiles = n_orders * n_y_tiles * n_slit_bins
-    tile_id[valid] = (
-        order_idx_map[valid] * (n_y_tiles * n_slit_bins)
-        + y_tile_map[valid] * n_slit_bins
-        + slit_bin_map[valid]
-    )
-    # WARP convention: rejection threshold is centered at ZERO, not at
-    # the segment mean (badpixmask.py:215, `np.absolute(mf_sc) < ...`).
-    # Matters when a tile's mean is shifted away from zero by an
-    # outlier — mean-centered keeps the outlier; zero-centered rejects
-    # it (order 164 tile 3 differed by Δfactor = +0.25 with the wrong
-    # center).
-    _, std_per_tile, _ = per_segment_clip(
-        diff_resid, tile_id, n_segments=n_tiles, sigma=clipsigma,
-        iterations=iteration, center="zero",
-    )
-    # Per-tile mean noise (no sigma clip; matches WARP's `np.average` at line 224).
-    noise_sum = np.bincount(tile_id[valid].ravel(), weights=noise[valid].ravel(), minlength=n_tiles)
-    noise_count = np.bincount(tile_id[valid].ravel(), minlength=n_tiles)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        noise_per_tile = np.where(noise_count > 0, noise_sum / noise_count, np.nan)
-    # Per (order, y-tile): max over slit bins.
-    std_3d = std_per_tile.reshape(n_orders, n_y_tiles, n_slit_bins)
-    noise_3d = noise_per_tile.reshape(n_orders, n_y_tiles, n_slit_bins)
-    std_max = np.nanmax(std_3d, axis=2)         # shape (n_orders, n_y_tiles)
-    noise_max = np.nanmax(noise_3d, axis=2)     # same shape
-    with np.errstate(invalid="ignore", divide="ignore"):
-        factor_2d = np.where(noise_max > 0, std_max / noise_max, 1.0)
-    factor_2d = np.maximum(factor_2d, 1.0)
-    # Broadcast factor back to per-pixel for the detection step. Pixels
-    # outside the y-tile range (Y=0 and Y>n_y_tiles*ystep) get factor=1
-    # by default — same as WARP, which simply doesn't process them in
-    # the factor loop but still applies the detection (threshold * noise).
-    factor_per_pixel = np.ones(apmask.shape, dtype=np.float64)
-    in_factor = in_aperture & y_tile_valid
-    if in_factor.any():
-        factor_per_pixel[in_factor] = factor_2d[
-            order_idx_map[in_factor], y_tile_map[in_factor]
-        ]
-
-    # --- Step 4-5: adaptive outer loop.
-    sigma_threshold = threshold
-    iter_count = 0
-    final_mask = np.zeros(diff.shape, dtype=np.int16)
-    final_pix = 0
-    while True:
-        iter_count += 1
-        local_thresh = sigma_threshold * noise * factor_per_pixel
-        triggered = diff_resid_abs > local_thresh
-        # Attribute sign: positive diff + positive raw1 → CR in obj;
-        # negative diff + positive raw2 → CR in sky.
-        attributable = (
-            (diff_sign_positive & raw1_sign_positive)
-            | (~diff_sign_positive & raw2_sign_positive)
-        )
-        # The CR mask itself does NOT exclude static-BP pixels — WARP
-        # saves the unfiltered maskarray (badpixmask.py:295). The
-        # downstream pipeline combines static + CR at fixpix time via
-        # `iraf.imarith(mask_file, "+", cr_mask, maskflat)` so the
-        # static-BP filter only matters for the var/ave histogram check.
-        #
-        # `y_tile_valid` excludes Y=0 and Y > n_y_tiles*ystep. WARP's
-        # detection step is wrapped inside the same `for j in range(len(
-        # factorlist[i]))` loop that built the factor map, so rows
-        # outside any y-tile are never written to maskarray at all
-        # (badpixmask.py:241-247). We match by gating cr_mask on
-        # `y_tile_valid` here.
-        cr_mask = (
-            triggered
-            & attributable
-            & in_aperture
-            & y_tile_valid
-        ).astype(np.int16)
-
-        # Position-cluster check uses only the non-static-BP pixels
-        # (WARP badpixmask.py:249 — `reqmask = (maskarray == 1) & (bpfdata == 0)`).
-        slit_in_mask = slitcoord[(cr_mask == 1) & (static_bp == 0)]
-        pix_num = int(slit_in_mask.size)
-        if pix_num == 0:
-            final_mask = cr_mask
-            final_pix = 0
-            break
-        hist, _ = np.histogram(slit_in_mask, bins=20, range=(xlim1, xlim2))
-        var = float(np.var(hist))
-        ave = float(np.mean(hist))
-        varave = var / ave if ave > 0 else 0.0
-
-        # Decide whether to bump the threshold.
-        if abba:
-            apos_lo, apos_hi = _NOD_POSITIONS["A"]
-            bpos_lo, bpos_hi = _NOD_POSITIONS["B"]
-            n_a = int(((slit_in_mask > apos_lo) & (slit_in_mask < apos_hi)).sum())
-            n_b = int(((slit_in_mask > bpos_lo) & (slit_in_mask < bpos_hi)).sum())
-            window_a = apos_hi - apos_lo
-            window_b = bpos_hi - bpos_lo
-            sp_ratio = (
-                max(n_a, n_b) / pix_num * (xlim2 - xlim1) / max(window_a, window_b)
-            )
-        else:
-            opos_lo, opos_hi = _NOD_POSITIONS["O"]
-            n_o = int(((slit_in_mask > opos_lo) & (slit_in_mask < opos_hi)).sum())
-            window_o = opos_hi - opos_lo
-            sp_ratio = n_o / pix_num * (xlim2 - xlim1) / window_o
-
-        clustered = (sp_ratio > slitposratio) and (varave > varatio)
-        if clustered and not fixsigma and sigma_threshold + sigstep <= max_sigma:
-            sigma_threshold += sigstep
-            continue
-
-        final_mask = cr_mask
-        final_pix = pix_num
-        break
+    # --- Step 4-5: adaptive outer loop (badpixmask.py:237-293), verbatim.
+    diffsign = diff_resid > 0
+    attributable = ((diffsign & (raw1_resid > 0)) | (~diffsign & (raw2_resid > 0))).ravel()
+    diff_abs_flat = diff_resid_abs.ravel()
+    bp_flat = np.asarray(static_bp).ravel()
+    apos, bpos, opos = _NOD_POSITIONS["A"], _NOD_POSITIONS["B"], _NOD_POSITIONS["O"]
+    missdetectionflag = True
+    sig_thres = threshold
+    itenum = 0
+    n_passes = 0
+    maskarray = np.zeros(H * W, dtype=np.int16)
+    pixnum = 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        while missdetectionflag and sig_thres <= max_sigma:
+            n_passes += 1
+            maskarray = np.zeros(H * W, dtype=np.int16)
+            for (idx, wsl), factors in zip(order_pix, factorlist):
+                for sl, factor in zip(wsl, factors):
+                    sub = idx[sl]
+                    reqcr = diff_abs_flat[sub] > sig_thres * flat_n[sub] * factor
+                    maskarray[sub[attributable[sub] & reqcr]] += 1
+            reqmask = (maskarray == 1) & (bp_flat == 0)
+            slit_mask = flat_sc[reqmask]
+            pixnum = np.sum(reqmask)
+            hist, _ = np.histogram(slit_mask, bins=20, range=(xlim1, xlim2))
+            varave = np.var(hist) / np.average(hist)
+            if abba:
+                anum = np.sum((slit_mask > apos[0]) & (slit_mask < apos[1]))
+                bnum = np.sum((slit_mask > bpos[0]) & (slit_mask < bpos[1]))
+                spratio = (max(anum, bnum) / pixnum * (xlim2 - xlim1)
+                           / max(apos[1] - apos[0], bpos[1] - bpos[0]))
+            else:
+                onum = np.sum((slit_mask > opos[0]) & (slit_mask < opos[1]))
+                spratio = onum / pixnum * (xlim2 - xlim1) / (opos[1] - opos[0])
+            if (spratio > slitposratio) & (varave > varatio) & (not fixsigma):
+                missdetectionflag = True
+                itenum += 1
+                sig_thres += sigstep
+            else:
+                missdetectionflag = False
 
     return CosmicRayResult(
-        mask=final_mask,
-        n_cosmic_rays=final_pix,
-        final_threshold=sigma_threshold,
-        iterations=iter_count,
+        mask=maskarray.reshape(H, W),
+        n_cosmic_rays=int(pixnum),
+        final_threshold=sig_thres,
+        iterations=n_passes,
     )
+
+
+def warp_noise_image(raw1: NDArray, raw2: NDArray, ndr1: int, ndr2: int, *,
+                     gain: float = _GAIN_E_PER_ADU) -> NDArray:
+    """WARP's CR noise model (``badpixmask.py:167-169``), same dtype and order.
+
+    ``median_filter(|raw1 + raw2|, slant footprint)`` in the raw frames' dtype
+    (float32), then ``(mf * gain + rn1 ** 2. + rn2 ** 2.) ** 0.5 / gain``
+    evaluated left to right (the read-noise terms are added one at a time).
+    """
+    summed = np.absolute(raw1 + raw2)
+    mf = scipy.ndimage.median_filter(summed, footprint=_make_slant_footprint(85.0, 10))
+    return warp_noise_from_median(mf, ndr1, ndr2, gain=gain)
+
+
+def warp_noise_from_median(mf: NDArray, ndr1: int, ndr2: int, *,
+                           gain: float = _GAIN_E_PER_ADU) -> NDArray:
+    """``(mf * gain + rn1 ** 2. + rn2 ** 2.) ** 0.5 / gain`` (badpixmask.py:169),
+    evaluated left to right in ``mf``'s dtype, from the median-filtered
+    ``|raw1 + raw2|``."""
+    return (mf * gain + _READ_NOISE_BY_NDR[ndr1] ** 2. + _READ_NOISE_BY_NDR[ndr2] ** 2.) ** 0.5 / gain
+
+
+def warp_y_windows(array_length: int, ystep: int) -> list[tuple[int, int]]:
+    """WARP's dispersion windows ``(y_s, y_e]`` (``badpixmask.py:191-235``).
+
+    The clamp ``y_e = arrayLength`` happens after the last processed window and
+    ends the loop, so rows above the last full window (and row 0) are in none.
+    """
+    out = []
+    y_s, y_e = 0, ystep
+    while y_e < array_length:
+        out.append((y_s, y_e))
+        y_s += ystep
+        y_e += ystep
+        if array_length - y_e < ystep:
+            y_e = array_length
+    return out
+
+
+def warp_slit_bins(xlim1: float, xlim2: float, bins: float) -> list[tuple[float, float]]:
+    """WARP's slit bins ``(r_s, r_e]`` (``badpixmask.py:200-229``).
+
+    ``r_s`` runs from ``xlim1 + bins`` while ``r_s < xlim2 - bins``: for the
+    default -30..30 / 2 these are the 28 bins (-28, -26] ... (26, 28]; the edge
+    strips (-30, -28] and (28, 30) are never measured.
+    """
+    out = []
+    r_s, r_e = xlim1 + bins, xlim1 + bins * 2
+    while r_s < xlim2 - bins:
+        out.append((r_s, r_e))
+        r_s += bins
+        r_e += bins
+    return out
+
+
+def _warp_window_factor(sc: NDArray, d: NDArray, n: NDArray, *, xlim1: float, xlim2: float,
+                        bins: float, clipsigma: float, iteration: int) -> object:
+    """One (order, y-window) factor, ``badpixmask.py:200-233`` line for line.
+
+    Empty selections give ``np.std``/``np.average`` NaN; ``max`` is Python's
+    builtin (a NaN in the first slot wins, a later NaN is skipped), and
+    ``max(1., nan)`` is 1. The returned object is what WARP multiplies by
+    (Python float 1.0 or a NumPy scalar of the noise dtype).
+    """
+    stdlist = []
+    noiselist = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        for r_s, r_e in warp_slit_bins(xlim1, xlim2, bins):
+            req = (r_s < sc) & (sc <= r_e)
+            mf_sc = d[req]
+            noise_sc = n[req]
+            mfstd = np.std(mf_sc)
+            for _ in range(iteration):
+                mfstd_last = mfstd
+                mf_req = np.absolute(mf_sc) < clipsigma * mfstd
+                mfstd = np.std(mf_sc[mf_req])
+                if mfstd_last == mfstd:
+                    break
+            stdlist.append(mfstd)
+            noiselist.append(np.average(noise_sc))
+        stdmax = max(stdlist)
+        noisemax = max(noiselist)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return max(1., stdmax / noisemax)
 
 
 def ndr_from_header(

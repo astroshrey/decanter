@@ -57,6 +57,11 @@ hrccs = [
     "radis>=0.16",
     "pyfastchem>=3.1",
 ]
+# mode="warp" runs its rectification on the Apple GPU when mlx is installed
+# (NumPy otherwise; the output bits are the same).
+mlx = [
+    "mlx>=0.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
 docs = [
     "sphinx>=7",
     "sphinx-rtd-theme>=2",

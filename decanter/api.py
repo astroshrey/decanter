@@ -16,6 +16,7 @@ from __future__ import annotations
 import warnings
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,11 +24,13 @@ import numpy as np
 from astropy.io import fits as _astrofits
 from numpy.typing import NDArray
 
-from decanter._reduction import Intermediates, OrderSpectrum, Reduction
+from decanter._reduction import Intermediates, OrderSpectrum, OrderSpectrum2D, Reduction
 from decanter.calib import Calibration
 from decanter.calib.aperture import ApertureSet
 from decanter.config import Config
 from decanter.extract.aperture_solve import solve_frame_aperture
+from decanter.extract.apsum_exact import apsum
+from decanter.io.apdb import parse as apdb_parse
 from decanter.extract.box_extract_1d import box_extract
 from decanter.extract.optimal_extract import optimal_extract
 from decanter.image2d import (
@@ -38,15 +41,52 @@ from decanter.io import headers
 from decanter.io.fsr import load as load_fsr
 from decanter.rectify import rectify_orders
 from decanter.utils.cosmic_ray import ndr_from_header
-from decanter.waveshift.apply import apply_waveshift_one_order
+from decanter.utils.iraf_imio import imio_read_real
+from decanter.utils.iraf_scopy import scopy_wavelength_truncate
+from decanter.waveshift.apply import apply_waveshift_one_order, shift_truncated
 from decanter.waveshift.measure import waveshift_clip, waveshift_one_order
 from decanter.wavelength import dispcor_one_order, truncate_spectrum
+from decanter.wavelength.fsr import fsr_bounds, truncate_spectrum_iraf
+from decanter.wavelength.iraf_wcs import DispcorWCS, dispcor_wcs
 
 if TYPE_CHECKING:
     from decanter.wavecal.config import WavecalConfig
     from decanter.wavecal.solution import WavecalSolution
 
 _OBJNAME_BAD_CHARS: tuple[str, ...] = (" ", "'", "\"", "#", "/")
+
+# Reduction recipes. "warp" (the default) is the WARP clone run by the
+# vectorised, calibration-cached implementation (decanter.fast); it gives
+# warp-reference's bits (docs/VECTORISED.md). "warp-reference" is the scalar,
+# stage-by-stage exact port, kept for verification (docs/BITEXACT.md).
+MODES: tuple[str, ...] = ("warp", "warp-reference")
+
+
+def resolve_mode(mode: str) -> str:
+    """Canonical recipe name for ``mode`` (``"warp"`` or ``"warp-reference"``).
+
+    Raises:
+        ValueError: for an unknown mode.
+    """
+    if mode not in MODES:
+        raise ValueError(
+            f"mode={mode!r} is not implemented; use 'warp' (the WARP clone, default) "
+            f"or 'warp-reference' (its scalar reference implementation)")
+    return mode
+
+
+def implementation(mode: str) -> dict[str, str]:
+    """What runs for ``mode``: ``{"mode", "implementation", "backend"}``.
+
+    ``implementation`` is ``"vectorised"`` (decanter.fast) or ``"reference"``;
+    ``backend`` is the s06 array backend of the vectorised implementation
+    (``"numpy"`` or ``"mlx"``), ``"numpy"`` for the reference one.
+    """
+    m = resolve_mode(mode)
+    if m == "warp":
+        from decanter.fast._backend import active_backend
+        return {"mode": m, "implementation": "vectorised", "backend": active_backend()}
+    return {"mode": m, "implementation": "reference", "backend": "numpy"}
 
 
 def _sanitize_objname(raw: str) -> str:
@@ -56,8 +96,62 @@ def _sanitize_objname(raw: str) -> str:
     return name
 
 
+def _comp_dy(comp: Path) -> float:
+    """The s06 transform ``dy``: the comp file's CDELT1.
+
+    WARP equivalent: ``warp/config.py`` ``self.dyinput = prihdr_comp["CDELT1"]``,
+    which raises when the keyword is missing; so does this (no 0.5 default).
+    """
+    header = _fits.read_image(comp)[1]
+    if "CDELT1" not in header:
+        raise KeyError(f"comp file {comp} has no CDELT1 (the transform dy); "
+                       f"WARP fails here too (warp/config.py: prihdr_comp['CDELT1'])")
+    return float(header["CDELT1"])
+
+
 def _is_abba(nodpos: str) -> bool:
     return "O" not in nodpos
+
+
+def _centersearch_abba(nodpos: str) -> bool:
+    """WARP's ``abbaflag`` for the PSF center search, which (unlike the
+    cosmic-ray step) also excludes ``NODPOS == "NA"`` (Warp_sci.py:395)."""
+    return _is_abba(nodpos) and nodpos.strip() != "NA"
+
+
+def check_supported(cfg: Config) -> None:
+    """Refuse parameter values WARP itself stops on.
+
+    Every WARP parameter-file option is implemented (``Background
+    Subtraction`` -> apall ``background``, ``CUTRANSFORM flux`` -> transform
+    ``flux``, ``Extract 2d spectrum`` -> apall ``format=strip`` +
+    ``resample2Dspec``).  WARP hands the two tokens to pyraf as typed, so a
+    value runs exactly when pyraf and the IRAF task take it:
+
+    * ``skysub_mode`` (with ``flag_skysub``): apall's ``background`` choice
+      list, minimum-matched (``med`` is ``median``, ``no`` is ``none``;
+      :func:`decanter.config.apall_background`);
+    * ``fluxinput``: ``yes``/``no`` in any case or ``y``/``n``
+      (:func:`decanter.config.pyraf_bool`; ``INDEF`` passes pyraf but
+      ``transform`` stops on it).
+
+    Raises:
+        ValueError: for a value WARP stops on ("ERROR in extraction" /
+            "ERROR in 2d image reduction").
+        NotImplementedError: for a pyraf ``)``-indirection (not modelled).
+    """
+    _ = cfg.apall_background   # raises ValueError for a token pyraf refuses
+    _ = cfg.transform_flux     # raises ValueError for a token WARP stops on
+
+
+def background_mode(cfg: Config) -> str:
+    """apall's ``background`` for the object extraction: the minimum-matched
+    ``Background Subtraction`` token, or ``none`` without it
+    (Warp_sci.py:437-438; :attr:`Config.apall_background`).  WARP's
+    background *products* follow ``cfg.flag_skysub`` instead: with
+    ``Background Subtraction: no`` apall subtracts nothing but WARP still
+    writes ``_none``, ``_bg``, ``_bgc``, ``_bgcw`` and the background panel."""
+    return cfg.apall_background
 
 
 def _read_input(
@@ -65,7 +159,12 @@ def _read_input(
     sky: Path | NDArray | None,
 ) -> tuple[NDArray, _astrofits.Header, NDArray | None, _astrofits.Header | None,
            Path | None, Path | None]:
-    """Resolve obj / sky to (data, header) tuples. Accept Path or NDArray."""
+    """Resolve obj / sky to (data, header) tuples. Accept a path (str or
+    os.PathLike) or an NDArray."""
+    if isinstance(obj, (str, os.PathLike)):
+        obj = Path(obj)
+    if isinstance(sky, (str, os.PathLike)):
+        sky = Path(sky)
     obj_path = obj if isinstance(obj, Path) else None
     sky_path = sky if isinstance(sky, Path) else None
     if isinstance(obj, Path):
@@ -95,6 +194,9 @@ def reduce(
     subtract_background: bool = False,
     extract: str = "box",
     optimal_profile: dict[int, tuple] | None = None,
+    aperture: tuple[float, float] | None = None,
+    background_region: str | None = None,
+    _warp_products: bool | str = False,
 ) -> Reduction:
     """Single-frame reduction of one WINERED object frame.
 
@@ -163,27 +265,94 @@ def reduce(
             the OH airglow lines — so it is the way to clean up an A-only
             (``sky=None``) spectrum, or to knock down OH residuals left by an
             imperfect A-B subtraction. Applied to the object path only.
-        mode: reduction recipe. Only ``"warp"`` (bit-for-bit WARP clone) is
-            implemented today; the argument exists so future recipes (e.g.
-            a ``"default"`` with decanter's own improved steps) are a
-            drop-in opt-in. Any other value raises ``ValueError``.
+        mode: reduction recipe. ``"warp"`` (default) is the WARP clone, run
+            by the vectorised, calibration-cached implementation
+            (:mod:`decanter.fast`; the rectification runs on the Apple GPU via
+            MLX when available): bit-identical to WARP from s07 on, and to
+            ``"warp-reference"`` everywhere except, on the MLX backend, float32
+            subnormals in s06 strip pixels the extraction never reads
+            (``docs/VECTORISED.md``). Only the extraction band of each rectified
+            strip is evaluated (the rest is NaN) unless
+            ``save_intermediates=True``, ``extract="optimal"`` or
+            ``subtract_background=True``, which rectify whole strips; the 1-D
+            extractions (``intermediates.spectra_1d`` / ``sky_1d`` /
+            ``strip_wcs``) are always kept. ``"warp-reference"`` is the scalar,
+            stage-by-stage exact port (slow; for verification,
+            ``docs/BITEXACT.md``). Any other value raises ``ValueError``.
         extract: 1D extraction method. ``"box"`` (default) is the WARP-parity
             box sum; ``"optimal"`` is Horne (1986) profile-weighted extraction
             (higher SNR, an algorithmic upgrade over WARP — see
             :mod:`decanter.extract.optimal_extract`).
+        aperture: manual ``(low, high)`` extraction window in pixels relative
+            to the trace (WARP's ``Manual Aperture: yes`` with the listfile's
+            ``ap=low:high``). Skips the center search; clamped to the
+            reference apertures as WARP does. Required when
+            ``config.flag_manual_aperture`` is set.
+        background_region: the listfile's ``bg=`` token, IRAF ``sample``
+            syntax relative to the aperture centre (e.g. ``"-6:-2,2:6"``).
+            WARP writes it into the frame's aperture database (``xmin``/
+            ``xmax``/``sample`` of the ``background`` section), which is what
+            apall's background (``config.flag_skysub`` /
+            ``config.skysub_mode``, the parameter file's ``Background
+            Subtraction``) samples; ``None`` is WARP's ``INDEF``: the
+            aperture window for ``average``/``median``/``minimum``, and for
+            ``fit`` IRAF's ``rg_xadd`` range ``[0, INDEFR]``, every point at or
+            right of the aperture centre (none for an aperture left of it,
+            sky 0). The sample is parsed as IRAF does, whatever it is;
+            ``reduce_to_warp_tree`` refuses beforehand the ``bg=`` tokens WARP
+            stops on (``warptree.check_bg_tokens``).
+
+    WARP's parameter-file options map to ``config``, their tokens taken as
+    pyraf takes them: ``Background Subtraction`` other than ``none`` sets
+    ``flag_skysub`` (``intermediates.spectra_1d_none`` keeps the plain sum,
+    ``intermediates.bg_dispcor`` the dispersion-corrected background) and is
+    apall's background, minimum-matched (``average``/``av``,
+    ``median``/``med``, ``minimum``/``mi``, ``fit``/``f``; ``no`` is
+    ``none``: nothing subtracted, the background products all zero);
+    ``CUTRANSFORM flux: yes`` (any case, or ``y``) multiplies the rectified
+    strips by the transform's Jacobian; ``Extract 2d spectrum: yes`` adds the
+    2-D spectra (``Reduction.obj_2d`` and ``Reduction.obj_2d_resample``). All
+    three follow WARP bit for bit (docs/BITEXACT.md).  Every IRAF task port
+    reads its input images as IRAF's FITS kernel does (``-0.0``,
+    subnormals, ``+-Inf``/NaN -> ``+0``; :mod:`decanter.utils.iraf_imio`).
+
+    Raises:
+        ValueError: for a parameter value WARP itself stops on
+            (:func:`check_supported`).
+        NotImplementedError: for a pyraf ``)``-indirection token.
 
     Returns:
         :class:`Reduction` carrying per-(fsr_cut, order) calibrated 1D
         spectra. Per-frame products keyed as ``(fsr_cut, order)`` so a
         caller can grab a specific order with ``r.obj[(1.05, 163)]``.
     """
-    if mode != "warp":
-        raise ValueError(
-            f"mode={mode!r} is not implemented; only 'warp' (the WARP-clone "
-            f"recipe) is available today")
+    fast = resolve_mode(mode) == "warp"
+    if fast:
+        from decanter import fast as _fast
+        from decanter.fast import apsum as _fast_apsum
+        from decanter.fast import rectify as _fast_rectify
     if extract not in ("box", "optimal"):
         raise ValueError(f"extract={extract!r} must be 'box' or 'optimal'")
     cfg = config or Config()
+    check_supported(cfg)
+    bg_mode = background_mode(cfg)
+    bgsample = "INDEF" if background_region is None else str(background_region)
+    # apall reads off-band pixels (background regions, 2-D strips): whole strips
+    warp_opts = bg_mode != "none" or cfg.flag_extract2d
+    # WARP's Background Subtraction products (_none, _bg, ...): flag_skysub,
+    # also when the token is "no" (apall background none, Warp_sci.py:563-569)
+    skysub = cfg.flag_skysub
+    if (warp_opts or skysub) and (extract != "box" or subtract_background):
+        raise ValueError(
+            "WARP's Background Subtraction / Extract 2d spectrum options act on the "
+            "box (apall) extraction; they cannot be combined with extract="
+            f"{extract!r} / subtract_background={subtract_background!r}")
+    flux = cfg.transform_flux
+    if cfg.flag_manual_aperture and aperture is None:
+        raise ValueError(
+            "config.flag_manual_aperture is set ('Manual Aperture: yes') but no "
+            "aperture=(low, high) was given (WARP reads it from the listfile's "
+            "ap=low:high token)")
     obj_data, obj_header, sky_data, sky_header, obj_path, sky_path = _read_input(
         obj, sky,
     )
@@ -205,29 +374,70 @@ def reduce(
     if save_intermediates:
         inter.obj_raw = obj_data
 
+    # Every IRAF task below reads its input images through the FITS kernel,
+    # which maps -0, subnormals, Inf and NaN to +0 (utils/iraf_imio:
+    # imio_read_real); WARP's Python steps (cosmic-ray mask, center search,
+    # resample2Dspec) read the files as written.
+    rd = imio_read_real
+
     # --- s01 sky subtract -------------------------------------------------
-    diff = sky_subtract(obj_data, sky_data) if sky_data is not None else obj_data.copy()
-    if save_intermediates:
+    diff = (sky_subtract(rd(obj_data), rd(sky_data)) if sky_data is not None
+            else obj_data.copy())
+    if save_intermediates or _warp_products:
         inter.obj_s = diff
 
     # --- s02 cosmic-ray mask ----------------------------------------------
-    if cfg.flag_bpmask and sky_data is not None:
+    # the vectorised detector hands over the whole-frame arrays WARP's
+    # 4-OBJ_mask holds when they are wanted (it computes them anyway)
+    cr_stats: dict = {"arrays": True} if _warp_products == "mask" else {}
+    if cfg.flag_bpmask and sky_data is not None and fast:
+        mask = _fast.cr_mask(
+            diff, obj_data, sky_data, calib, static_bp,
+            nodpos=nodpos,
+            ndr_obj=ndr_from_header(obj_header),
+            ndr_sky=ndr_from_header(sky_header) if sky_header is not None else 1,
+            config=cfg, stats=cr_stats,
+        )
+    elif cfg.flag_bpmask and sky_data is not None:
         mask = cr_mask(
             diff, obj_data, sky_data, apset_multi, static_bp,
             nodpos=nodpos,
             ndr_obj=ndr_from_header(obj_header),
             ndr_sky=ndr_from_header(sky_header) if sky_header is not None else 1,
-            config=cfg,
+            config=cfg, stats=cr_stats,
         )
     else:
         mask = np.zeros_like(static_bp, dtype=np.int16)
-    if save_intermediates:
+    if save_intermediates or _warp_products:
         inter.cr_mask = mask
-    combined_mask = mask.astype(bool) | static_bp.astype(bool)
+    if "pixnum" in cr_stats:
+        inter.cr_stats = (cr_stats["pixnum"], cr_stats["sigthres"])
+    if _warp_products == "mask" and cfg.flag_bpmask and sky_data is not None:
+        # WARP's other cosmic-ray products (badpixmask.py:146-171): the
+        # median-filter residuals of the difference frame and the noise frame
+        # (written to 4-OBJ_mask only; _warp_products="mask" asks for them).
+        from decanter.utils.cosmic_ray import warp_noise_from_median, warp_noise_image
+        ndr_o = ndr_from_header(obj_header)
+        ndr_s = ndr_from_header(sky_header) if sky_header is not None else 1
+        if "mf1" in cr_stats:
+            inter.extra["mf1"] = cr_stats["mf1"]
+            inter.extra["mf2"] = cr_stats["mf2"]
+            inter.extra["noise"] = warp_noise_from_median(cr_stats["smoothed"], ndr_o, ndr_s)
+        else:
+            from decanter.utils.median_filter import median_filter as _mf
+            mf1 = diff - _mf(diff, size=(5, 1))
+            inter.extra["mf1"] = mf1
+            inter.extra["mf2"] = mf1 - _mf(mf1, footprint=np.identity(5))
+            inter.extra["noise"] = warp_noise_image(obj_data, sky_data, ndr_o, ndr_s)
+    # WARP maskflat_* (Warp_sci.py:352): imarith REAL sum static + CR; fixpix
+    # reads it as INTEGER (truncated), > 0 bad (decanter.utils.fixpix).
+    combined_mask = static_bp.astype(np.float32) + mask.astype(np.float32)
+    if _warp_products:
+        inter.extra["maskflat"] = combined_mask
 
     # --- s03 apscatter ----------------------------------------------------
     if cfg.flag_apscatter:
-        obj_ssc, scatter = subtract_apscatter(diff, apset_apsc)
+        obj_ssc, scatter = subtract_apscatter(rd(diff), apset_apsc)
     else:
         obj_ssc, scatter = diff, np.zeros_like(diff)
     if save_intermediates:
@@ -235,54 +445,82 @@ def reduce(
         inter.scatter_model = scatter
 
     # --- s04 flatfield divide --------------------------------------------
-    obj_sscf = flatfield_divide(obj_ssc, flat)
+    obj_sscf = flatfield_divide(rd(obj_ssc), rd(flat))
     if save_intermediates:
         inter.obj_sscf = obj_sscf
 
     # --- s05 fixpix -------------------------------------------------------
-    obj_sscfm = fix_bad_pixels(obj_sscf, combined_mask)
-    if save_intermediates:
+    obj_sscfm = fix_bad_pixels(rd(obj_sscf), combined_mask)   # imcopy + fixpix
+    if save_intermediates or _warp_products:
         inter.obj_sscfm = obj_sscfm
 
     # Sky 2D path (when requested)
     sky_fm = None
     if cfg.flag_skyemission and sky_data is not None:
-        sky_f = flatfield_divide(sky_data, flat)
-        sky_fm = fix_bad_pixels(sky_f, combined_mask)
+        sky_f = flatfield_divide(rd(sky_data), rd(flat))
+        sky_fm = fix_bad_pixels(rd(sky_f), combined_mask)
         if save_intermediates:
             inter.sky_f = sky_f
             inter.sky_fm = sky_fm
 
     # --- s06 rectify per order -------------------------------------------
+    # (cutransform: imcopy of each order's columns, then transform)
+    sscfm_in = rd(obj_sscfm)
+    fm_in = rd(sky_fm) if sky_fm is not None else None
     orders = (
         apset_multi.echelle_orders
         if (cfg.reduce_full_data or not cfg.selected_orders)
         else tuple(m for m in apset_multi.echelle_orders if m in cfg.selected_orders)
     )
-    # Comp file's CDELT1 is dy.
-    comp_header = _fits.read_image(calib.comp)[1]
-    dy = float(comp_header.get("CDELT1", 0.5))
+    dy = _comp_dy(calib.comp)
 
-    strips_obj = rectify_orders(
-        obj_sscfm, apset_multi,
-        fc_dir=calib.fc_dir, fc_refname=calib.fc_refname, dy=dy, orders=orders,
-    )
+    # A manual window replaces any per-frame DBs (it is what WARP writes
+    # into them in manual-aperture mode).
+    trans_apdbs = {} if aperture is not None else (calib.trans_apdbs or {})
+    if fast:
+        # Fast s06: rectify obj and sky together; evaluate only the band of
+        # each strip the extraction reads (the multihole reference window),
+        # unless whole strips are wanted or an aperture leaves the band.
+        # (the background regions and the 2-D strips may read beyond the
+        # band; whole strips keep every option exact)
+        whole = save_intermediates or extract != "box" or subtract_background or warp_opts
+        full_orders = set() if whole else _fast_rectify.orders_needing_full(
+            apset_multi, orders, fc_dir=calib.fc_dir, fc_refname=calib.fc_refname,
+            dy=dy, ref_trans_apdbs=calib.ref_trans_apdbs, trans_apdbs=trans_apdbs)
+        # The background regions and the 2-D strips (resample2Dspec reads
+        # twice the aperture around the trace) can read off-band pixels,
+        # where the MLX backend's float32 subnormals may differ from WARP
+        # (docs/VECTORISED.md): with those options rectify on the CPU (exact).
+        rect_backend = "numpy" if warp_opts else None
+        rect = _fast_rectify.rectify_orders_multi(
+            [sscfm_in] + ([fm_in] if fm_in is not None else []), apset_multi,
+            fc_dir=calib.fc_dir, fc_refname=calib.fc_refname, dy=dy, orders=orders,
+            ref_trans_apdbs=calib.ref_trans_apdbs, full_orders=full_orders, full=whole,
+            flux=flux, backend=rect_backend)
+        strips_obj = rect[0]
+        strips_sky_full = rect[1] if sky_fm is not None else None
+    else:
+        strips_obj = rectify_orders(
+            sscfm_in, apset_multi,
+            fc_dir=calib.fc_dir, fc_refname=calib.fc_refname, dy=dy, orders=orders,
+            flux=flux,
+        )
+        strips_sky_full = None
+        if sky_fm is not None:
+            strips_sky_full = rectify_orders(
+                fm_in, apset_multi,
+                fc_dir=calib.fc_dir, fc_refname=calib.fc_refname, dy=dy, orders=orders,
+                flux=flux,
+            )
     if save_intermediates:
         inter.strips_obj = {m: s.data for m, s in strips_obj.items()}
-
     strips_sky_arrays: dict[int, NDArray] = {}
-    strips_sky_full = None
-    if sky_fm is not None:
-        strips_sky_full = rectify_orders(
-            sky_fm, apset_multi,
-            fc_dir=calib.fc_dir, fc_refname=calib.fc_refname, dy=dy, orders=orders,
-        )
+    if strips_sky_full is not None:
         strips_sky_arrays = {m: s.data for m, s in strips_sky_full.items()}
         if save_intermediates:
             inter.strips_sky = strips_sky_arrays
 
     # --- s07/s08 trace + 1D extract --------------------------------------
-    trans_apdbs = calib.trans_apdbs or {}
     obj_1d: dict[int, NDArray] = {}
     sky_1d: dict[int, NDArray] = {}
 
@@ -301,49 +539,158 @@ def reduce(
                 "cannot determine the extraction trace."
             )
         frame_ap = solve_frame_aperture(
-            strips_obj, ref_trans, abba=_is_abba(nodpos),
+            strips_obj, ref_trans, abba=_centersearch_abba(nodpos), window=aperture,
+            bgsample=bgsample,
         )
 
-    for m, strip in strips_obj.items():
-        strip_arr = strip.data
-        if m in trans_apdbs:
-            trans_set = ApertureSet.load(
-                trans_apdbs[m], array_length=strip_arr.shape[0]
-            )
-            if m in trans_set.apertures:
-                trans_ap = trans_set.apertures[m]
-                ap_low, ap_high = float(trans_ap.entry.low), float(trans_ap.entry.high)
-                trace_x = trans_ap.trace_x
+    ap_used: dict[int, tuple[float, float]] = {}
+    ap_refs: dict[int, Path] = {}
+    # WARP's Background Subtraction / Extract 2d spectrum products
+    obj_1d_none: dict[int, NDArray] = {}
+    strips_2d: dict[int, object] = {}
+    strips_2d_resample: dict[int, NDArray] = {}
+
+    def _warp_options(m, strip_arr, entry) -> None:
+        """apall ``background=<mode>`` for the object sum (the plain sum kept
+        as ``_none``) and ``format=strip`` + ``resample2Dspec``
+        (Warp_sci.py:561-584)."""
+        from decanter.extract import apbackground as _apb
+        from decanter.extract.resample2d import resample_2d
+        sky_line = None
+        if skysub:
+            # apall background=none (the plain sum WARP keeps as _none)
+            obj_1d_none[m] = obj_1d[m]
+        if bg_mode != "none":
+            if fast:
+                if _apb.background_of(entry) is not None:
+                    sky_line, _ = _apb.sky_values_fast(strip_arr, entry, bg_mode)
+                obj_1d[m] = _apb.apsum_background_fast(strip_arr, entry, bg_mode, sky=sky_line)
             else:
-                sub = solve_frame_aperture(
-                    {m: strip}, calib.ref_trans_apdbs or {}, abba=_is_abba(nodpos),
+                if _apb.background_of(entry) is not None:
+                    sky_line, _ = _apb.sky_values(strip_arr, entry, bg_mode)
+                obj_1d[m] = _apb.apsum_background(strip_arr, entry, bg_mode, sky=sky_line)
+        if cfg.flag_extract2d:
+            ex = _apb.strip_extract_fast if fast else _apb.strip_extract
+            strips_2d[m] = ex(strip_arr, entry, bg_mode, sky=sky_line)
+            strips_2d_resample[m] = resample_2d(strip_arr, entry)
+
+    def _solve_one_order(m, strip):
+        # Locked-path fallback (no WARP equivalent): same center search and
+        # abbaflag as the free path, on this order only.
+        if not calib.ref_trans_apdbs or m not in calib.ref_trans_apdbs:
+            raise ValueError(f"order {m}: no per-frame trans DB and no multihole "
+                             f"trans reference aperture to solve it from")
+        return solve_frame_aperture({m: strip}, calib.ref_trans_apdbs,
+                                    abba=_centersearch_abba(nodpos), bgsample=bgsample)
+
+    def _extract_orders(ms) -> None:
+        for m in ms:
+            strip = strips_obj[m]
+            strip_arr = strip.data
+            sub = None
+            ap_refs[m] = Path(trans_apdbs[m]) if m in trans_apdbs else Path(
+                (calib.ref_trans_apdbs or {}).get(m, ""))
+            if m in trans_apdbs:
+                trans_set = ApertureSet.load(
+                    trans_apdbs[m], array_length=strip_arr.shape[0]
                 )
+                if m in trans_set.apertures:
+                    trans_ap = trans_set.apertures[m]
+                    ap_low, ap_high = float(trans_ap.entry.low), float(trans_ap.entry.high)
+                    trace_x = trans_ap.trace_x
+                else:
+                    sub = _solve_one_order(m, strip)
+            elif frame_ap is None:
+                # Locked, but this order has no per-frame DB: solve it alone.
+                sub = _solve_one_order(m, strip)
+            else:
+                trace_x = frame_ap.traces[m]
+                ap_low, ap_high = frame_ap.ap_low, frame_ap.ap_high
+            if sub is not None:
                 trace_x = sub.traces[m]
                 ap_low, ap_high = sub.ap_low, sub.ap_high
-        else:
-            trace_x = frame_ap.traces[m]
-            ap_low, ap_high = frame_ap.ap_low, frame_ap.ap_high
-        if extract == "optimal":
-            prof = optimal_profile.get(m) if optimal_profile else None
-            obj_1d[m] = optimal_extract(strip_arr, trace_x,
-                                        ap_low=ap_low, ap_high=ap_high, profile=prof)
-            if m in strips_sky_arrays:
-                sky_1d[m] = optimal_extract(strips_sky_arrays[m], trace_x,
+            ap_used[m] = (float(ap_low), float(ap_high))
+            exact_entry = None
+            if sub is not None and extract == "box" and not subtract_background:
+                exact_entry = sub.entries.get(m)
+            elif m in trans_apdbs and extract == "box" and not subtract_background:
+                exact_entry = apdb_parse(trans_apdbs[m]).get(m)
+            elif frame_ap is not None and extract == "box" and not subtract_background:
+                # Free path: the per-frame aperture database WARP would write,
+                # token for token (extract.aperture_solve.solve_frame_apdb).
+                exact_entry = frame_ap.entries.get(m)
+            if exact_entry is not None and fast:
+                # Same bit-exact apall, obj and sky together, geometry cached.
+                pair = [strip_arr] + ([strips_sky_arrays[m]] if m in strips_sky_arrays else [])
+                sums = _fast_apsum.apsum_multi(pair, exact_entry)
+                obj_1d[m] = sums[0]
+                if m in strips_sky_arrays:
+                    sky_1d[m] = sums[1]
+            elif exact_entry is not None:
+                # Bit-exact apall (ap_sum) on WARP's per-frame aperture database.
+                obj_1d[m] = apsum(strip_arr, exact_entry)
+                if m in strips_sky_arrays:
+                    sky_1d[m] = apsum(strips_sky_arrays[m], exact_entry)
+            elif extract == "optimal":
+                prof = optimal_profile.get(m) if optimal_profile else None
+                obj_1d[m] = optimal_extract(strip_arr, trace_x,
                                             ap_low=ap_low, ap_high=ap_high, profile=prof)
-        else:
-            obj_1d[m] = box_extract(strip_arr, trace_x, ap_low=ap_low, ap_high=ap_high,
-                                    subtract_background=subtract_background)
-            if m in strips_sky_arrays:
-                sky_1d[m] = box_extract(
-                    strips_sky_arrays[m], trace_x, ap_low=ap_low, ap_high=ap_high,
-                )
-    if save_intermediates:
+                if m in strips_sky_arrays:
+                    sky_1d[m] = optimal_extract(strips_sky_arrays[m], trace_x,
+                                                ap_low=ap_low, ap_high=ap_high, profile=prof)
+            else:
+                obj_1d[m] = box_extract(strip_arr, trace_x, ap_low=ap_low, ap_high=ap_high,
+                                        subtract_background=subtract_background)
+                if m in strips_sky_arrays:
+                    sky_1d[m] = box_extract(
+                        strips_sky_arrays[m], trace_x, ap_low=ap_low, ap_high=ap_high,
+                    )
+            if warp_opts or skysub:
+                if exact_entry is None:
+                    raise ValueError(f"order {m}: WARP's background / 2-D options need the "
+                                     f"per-frame aperture database (box extraction)")
+                _warp_options(m, strip_arr, exact_entry)
+
+    _extract_orders(list(strips_obj))
+    if fast:
+        # Safety net: an order whose extraction read outside its evaluated
+        # band (NaN there) is rectified in full and extracted again.
+        redo = _fast_rectify.orders_to_redo(strips_obj, obj_1d, sky_1d)
+        if redo:
+            rect = _fast_rectify.rectify_orders_multi(
+                [sscfm_in] + ([fm_in] if fm_in is not None else []), apset_multi,
+                fc_dir=calib.fc_dir, fc_refname=calib.fc_refname, dy=dy, orders=redo,
+                full=True, flux=flux, backend=rect_backend)
+            for m in redo:
+                strips_obj[m] = rect[0][m]
+                if sky_fm is not None:
+                    strips_sky_arrays[m] = rect[1][m].data
+            _extract_orders(redo)
+    if save_intermediates or fast:
         inter.spectra_1d = dict(obj_1d)
         inter.sky_1d = dict(sky_1d)
+    inter.spectra_1d_none = dict(obj_1d_none)
+    inter.strips_2d = {m: sr.data for m, sr in strips_2d.items()}
+    inter.strip_2d_limits = {m: (sr.low, sr.high) for m, sr in strips_2d.items()}
+    inter.strips_2d_resample = dict(strips_2d_resample)
+    # sarith(none - background-subtracted): the background spectrum (SN = n)
+    bg_1d = {m: (rd(obj_1d_none[m]) - rd(obj_1d[m])).astype(np.float32)
+             for m in obj_1d_none}
 
-    strips_lambda = {m: (strips_obj[m].lambda_min, strips_obj[m].dy) for m in obj_1d}
-    if save_intermediates:
+    # s11 reads the 1-D spectrum's CRVAL1/CDELT1 back from the FITS header
+    # that apall wrote from the strip's header text (IRAF ctod/imputd round
+    # trips), so hand it exactly those values.
+    strips_lambda = {m: _extracted_wcs(strips_obj[m]) for m in obj_1d}
+    if save_intermediates or fast:
         inter.strip_wcs = strips_lambda
+    if save_intermediates or fast or _warp_products:
+        inter.strip_meta = {m: (strips_obj[m].crval2_text, getattr(strips_obj[m], "cdelt2_text", ""),
+                                int(np.asarray(strips_obj[m].data).shape[0]),
+                                int(strips_obj[m].xmin), int(strips_obj[m].xmax))
+                            for m in obj_1d}
+    if _warp_products:
+        _centersearch_products(inter, strips_obj, calib, frame_ap, nodpos,
+                               manual=aperture is not None)
 
     # Carried on the reduction so a multi-frame analysis can read mid-times,
     # pointing and instrument configuration off the reduced products.
@@ -356,11 +703,92 @@ def reduce(
     r = _finalize_wavelength(
         obj_1d, sky_1d, strips_lambda, objname, obj_path, sky_path,
         calib, cfg, inter, shift_wave=shift_wave,
-        save_intermediates=save_intermediates, meta=meta,
+        save_intermediates=save_intermediates, meta=meta, fast=fast,
+        bg_1d=bg_1d, twod={"strip": inter.strips_2d, "resample": inter.strips_2d_resample},
     )
+    r.obj_header = obj_header if obj_path is not None else None
+    r.sky_header = sky_header if sky_path is not None else None
+    r.apertures = ap_used
+    r.aperture_refs = ap_refs
+    if frame_ap is not None:
+        r.centersearch_undefined = {m: n for m, n in frame_ap.minpack_undefined.items() if n}
     if workdir is not None:
         r.write_to(workdir, save_intermediates=save_intermediates)
     return r
+
+
+def _centersearch_products(inter: Intermediates, strips_obj, calib, frame_ap, nodpos: str, *,
+                           manual: bool) -> None:
+    """WARP's center-search log values and spatial-profile ``.dat`` data.
+
+    Free path: from the aperture solution. Locked path (WARP's per-frame
+    databases supplied): the center search is run for the logs only. A NaN
+    center (WARP gives up) or a manual aperture: ``make_slit_profile``
+    (``Warp_sci.py:403-404, 426``).
+    """
+    from decanter.extract.aperture_solve import _strip_wcs, solve_frame_apdb
+    from decanter.io.apdb import parse as parse_apdb
+    from decanter.utils.psf import warp_slit_profile
+    refs_paths = calib.ref_trans_apdbs or {}
+    xcenter: dict = {}
+    fwhm: dict = {}
+    profiles: dict = {}
+    if not manual:
+        if frame_ap is not None and frame_ap.xcenter:
+            xcenter, fwhm, profiles = frame_ap.xcenter, frame_ap.fwhm, dict(frame_ap.profiles)
+        elif refs_paths:
+            try:
+                sol = solve_frame_apdb(strips_obj, refs_paths, abba=_centersearch_abba(nodpos))
+                xcenter, fwhm, profiles = sol.xcenter, sol.fwhm, dict(sol.profiles)
+            except ValueError:
+                pass
+        inter.centersearch = {m: (xcenter[m], fwhm[m]) for m in xcenter}
+    for m in strips_obj:
+        if m not in refs_paths:
+            continue
+        if manual or (m in xcenter and not np.isfinite(xcenter[m])):
+            data, crval2, cdelt2, crpix2 = _strip_wcs(strips_obj[m])
+            profiles[m] = warp_slit_profile(data, parse_apdb(refs_paths[m])[m],
+                                            crval2=crval2, cdelt2=cdelt2, crpix2=crpix2)
+    inter.slit_profiles = profiles
+
+
+def _extracted_wcs(strip) -> tuple[float, float]:
+    """(CRVAL1, CDELT1) as WARP's s11 ``scopy`` reads them from the apall output."""
+    from decanter.utils.fpemu import iraf_ctod
+    from decanter.utils.iraf_fmt import iraf_imputd_text
+
+    def rt(text: str, fallback: float) -> float:
+        if not text:
+            return float(fallback)
+        return iraf_ctod(iraf_imputd_text(iraf_ctod(text)))
+
+    cdelt_text = getattr(strip, "cdelt2_text", "")
+    nrows = int(np.asarray(strip.data).shape[0])
+    if strip.crval2_text and cdelt_text and nrows > 1:
+        # apall's extracted WCS (apmw_open: fused logical->world at pixels 1
+        # and n of the strip's dispersion axis), as its header text is re-read.
+        from decanter.warptree_chain import apall_dispersion
+        w1, dw = apall_dispersion(strip.crval2_text, cdelt_text, nrows)
+        return (iraf_ctod(iraf_imputd_text(w1)), iraf_ctod(iraf_imputd_text(dw)))
+    return (rt(strip.crval2_text, strip.lambda_min), rt(cdelt_text, strip.dy))
+
+
+def _truncated_c(it: Intermediates, m: int) -> NDArray[np.float32]:
+    """The s11 ``_m###c`` spectrum (truncated, unshifted) of order ``m``.
+
+    Taken from ``it.spectra_trunc`` when the reduction kept it, else computed
+    from the 1-D extraction exactly as :func:`_finalize_wavelength` does.
+    """
+    if m in it.spectra_trunc:
+        return np.asarray(it.spectra_trunc[m], dtype=np.float32)
+    lambda_min, dy = it.strip_wcs[m]
+    h = _astrofits.Header()
+    h["CRVAL1"] = lambda_min
+    h["CDELT1"] = dy
+    h["CRPIX1"] = 1.0
+    trunc = scopy_wavelength_truncate(np.asarray(it.spectra_1d[m]), h, w1=1.0, w2=2048.0)
+    return np.asarray(trunc.data, dtype=np.float32)
 
 
 def _finalize_wavelength(
@@ -377,6 +805,9 @@ def _finalize_wavelength(
     shift_wave: float,
     save_intermediates: bool,
     meta: dict | None = None,
+    fast: bool = False,
+    bg_1d: dict[int, NDArray] | None = None,
+    twod: dict[str, dict[int, NDArray]] | None = None,
 ) -> Reduction:
     """s11–s13: truncate (with optional shift) → dispcor → FSR cut → Reduction.
 
@@ -384,8 +815,23 @@ def _finalize_wavelength(
     cheap tail with a per-frame ``shift_wave`` without repeating the expensive
     2D + rectify + extract work. ``strips_lambda`` maps order → the rectified
     strip's ``(lambda_min, dy)`` linear-WCS pair (the only thing the s11
-    truncate needs from s06).
+    truncate needs from s06). ``fast`` takes the dispcor pixel map from
+    :func:`decanter.fast.wavelength.dispcor_edges_fast` (identical edges,
+    computed without FMA emulation).
+
+    ``bg_1d`` (WARP's Background Subtraction): per order the background
+    spectrum (``_bg``), truncated and dispersion-corrected like the object
+    but never shifted (``Warp_sci.py:566-568, 646-648``) into
+    ``inter.bg_trunc`` / ``inter.bg_dispcor``.  ``twod`` (Extract 2d
+    spectrum): ``{"strip"|"resample": {order: (rows, lines)}}``; every row
+    goes through the object's s11-s12 (``scopy`` truncate, the cross-frame
+    shift, ``dispcor``: Warp_sci.py:580-584, 671-686) into
+    ``inter.twod_trunc`` / ``inter.twod_shifted`` and
+    ``Reduction.obj_2d`` / ``obj_2d_resample``.
     """
+    edges_fn = None
+    if fast:
+        from decanter.fast.wavelength import dispcor_edges_fast as edges_fn
     # --- s11 truncate (shift=shift_wave). Even at shift 0, WARP runs
     # scopy(rebin=YES) to truncate the rectified strip to the [1, 2048] Å
     # range, setting the input length for dispcor.
@@ -397,59 +843,140 @@ def _finalize_wavelength(
         h["CRVAL1"] = lambda_min
         h["CDELT1"] = dy
         h["CRPIX1"] = 1.0
-        obj_truncated[m] = apply_waveshift_one_order(spec, h, shift_wave=shift_wave)
+        trunc = scopy_wavelength_truncate(np.asarray(spec), h, w1=1.0, w2=2048.0)
+        cd_c = float(trunc.header.get("CDELT1", 1.0))
+        shifted = shift_truncated(trunc.data, cd_c, shift_wave)
+        hs = trunc.header.copy()
+        hs["CRVAL1"] = 1.0
+        hs["CRPIX1"] = 1.0
+        obj_truncated[m] = (shifted.astype(np.float32), hs)
+        if save_intermediates:
+            inter.spectra_trunc[m] = np.asarray(trunc.data, dtype=np.float32)
+            inter.spectra_shifted[m] = shifted.astype(np.float32)
         if m in sky_1d:
             # WARP never waveshifts the sky path (truncate only); sky shift = 0.
-            sky_truncated[m] = apply_waveshift_one_order(sky_1d[m], h, shift_wave=0.0)
+            st = scopy_wavelength_truncate(np.asarray(sky_1d[m]), h, w1=1.0, w2=2048.0)
+            sky_truncated[m] = (np.asarray(st.data, dtype=np.float32), st.header)
+            if save_intermediates:
+                inter.sky_trunc[m] = np.asarray(st.data, dtype=np.float32)
 
     # --- s12 dispcor per order -------------------------------------------
     obj_dispcor: dict[int, tuple[NDArray, _astrofits.Header]] = {}
     sky_dispcor_d: dict[int, tuple[NDArray, _astrofits.Header]] = {}
+    disp_wcs: dict[int, DispcorWCS] = {}
+    id_paths = {m: Path(calib.id_dir) / f"id{calib.id_refname}.{m:04d}"
+                for m in obj_truncated}
+    id_paths = {m: p for m, p in id_paths.items() if p.exists()}
+    order_ids = tuple(id_paths[m] for m in sorted(id_paths))
     for m, (trunc_data, trunc_header) in obj_truncated.items():
-        id_path = Path(calib.id_dir) / f"id{calib.id_refname}.{m:04d}"
-        if not id_path.exists():
+        if m not in id_paths:
             continue
-        obj_dispcor[m] = dispcor_one_order(trunc_data, trunc_header, id_path)
+        id_path = id_paths[m]
+        obj_dispcor[m] = dispcor_one_order(trunc_data, trunc_header, id_path,
+                                           order_ids=order_ids, edges_fn=edges_fn)
+        d_hdr = obj_dispcor[m][1]
+        disp_wcs[m] = dispcor_wcs(float(d_hdr["CRVAL1"]), float(d_hdr["CDELT1"]),
+                                  int(obj_dispcor[m][0].size))
         if m in sky_truncated:
             sky_data_t, sky_header_t = sky_truncated[m]
-            sky_dispcor_d[m] = dispcor_one_order(sky_data_t, sky_header_t, id_path)
+            sky_dispcor_d[m] = dispcor_one_order(sky_data_t, sky_header_t, id_path,
+                                                 order_ids=order_ids, edges_fn=edges_fn)
     if save_intermediates:
         inter.spectra_dispcor = {m: a for m, (a, _) in obj_dispcor.items()}
         inter.sky_dispcor = {m: a for m, (a, _) in sky_dispcor_d.items()}
+        inter.dispcor_wcs = dict(disp_wcs)
+
+    def _hdr_c(m):
+        lambda_min, dy = strips_lambda[m]
+        h = _astrofits.Header()
+        h["CRVAL1"] = lambda_min
+        h["CDELT1"] = dy
+        h["CRPIX1"] = 1.0
+        return h
+
+    # Background Subtraction: _bg -> _bgc (truncate) -> _bgcw (dispcor)
+    for m, bg in (bg_1d or {}).items():
+        if m not in obj_truncated:
+            continue
+        bt = scopy_wavelength_truncate(np.asarray(bg), _hdr_c(m), w1=1.0, w2=2048.0)
+        inter.bg_trunc[m] = np.asarray(bt.data, dtype=np.float32)
+        if m in id_paths:
+            hb = bt.header.copy()
+            hb["CRVAL1"] = 1.0
+            hb["CRPIX1"] = 1.0
+            bd, bh = dispcor_one_order(inter.bg_trunc[m], hb, id_paths[m], order_ids=order_ids,
+                                       edges_fn=edges_fn)
+            inter.bg_dispcor[m] = bd
+            inter.bg_dispcor_wcs[m] = dispcor_wcs(float(bh["CRVAL1"]), float(bh["CDELT1"]),
+                                                  int(np.asarray(bd).size))
+
+    # Extract 2d spectrum: every row through the object's s11-s12
+    obj_2d: dict[str, dict[int, OrderSpectrum2D]] = {"strip": {}, "resample": {}}
+    for variant, arrays in (twod or {}).items():
+        for m, arr in arrays.items():
+            if m not in obj_truncated:
+                continue
+            rows_c, rows_s, rows_w = [], [], []
+            arr = np.asarray(arr, dtype=np.float32)
+            for row in arr:
+                t = scopy_wavelength_truncate(row, _hdr_c(m), w1=1.0, w2=2048.0)
+                tc = np.asarray(t.data, dtype=np.float32)
+                cd_c = float(t.header.get("CDELT1", 1.0))
+                sh = shift_truncated(tc, cd_c, shift_wave,
+                                     multispec=arr.shape[0] > 1).astype(np.float32)
+                rows_c.append(tc)
+                rows_s.append(sh)
+                if m in id_paths:
+                    hs = t.header.copy()
+                    hs["CRVAL1"] = 1.0
+                    hs["CRPIX1"] = 1.0
+                    rows_w.append(dispcor_one_order(sh, hs, id_paths[m], order_ids=order_ids,
+                                                    edges_fn=edges_fn)[0])
+            inter.twod_trunc[(variant, m)] = np.array(rows_c, dtype=np.float32)
+            inter.twod_shifted[(variant, m)] = np.array(rows_s, dtype=np.float32)
+            if rows_w and m in disp_wcs:
+                dc = disp_wcs[m]
+                obj_2d[variant][m] = OrderSpectrum2D(
+                    order=m, flux=np.array(rows_w, dtype=np.float32),
+                    crval1=float(dc.w1), cdelt1=float(dc.dw))
 
     # --- s13 FSR truncate -> final per-cut per-order spectra -------------
+    # IRAF re-reads the dispcor WCS from the _csw header text, and the FSR
+    # bounds arrive through pyraf's 12-digit real text; see
+    # wavelength/iraf_wcs.py. The header WCS IRAF writes is kept with the
+    # spectrum for the WARP-layout writer.
     fsr_table = load_fsr(calib.fsr_table)
     obj_out: dict[tuple[float, int], OrderSpectrum] = {}
     sky_out: dict[tuple[float, int], OrderSpectrum] = {}
 
-    def _fsr_cut(data: NDArray, hdr: _astrofits.Header, m: int, cut: float
-                 ) -> OrderSpectrum | None:
-        if m not in fsr_table:
+    def _fsr_cut(data: NDArray, m: int, cut: float) -> OrderSpectrum | None:
+        if m not in fsr_table or m not in disp_wcs:
             return None
-        fsr_lo = fsr_table[m].lambda_min
-        fsr_hi = fsr_table[m].lambda_max
-        center = (fsr_lo + fsr_hi) / 2.0
-        lo = center - (center - fsr_lo) * float(cut)
-        hi = center + (fsr_hi - center) * float(cut)
-        sliced, wcs = truncate_spectrum(
-            data, float(hdr["CRVAL1"]), float(hdr["CDELT1"]), lo, hi,
-        )
+        lo, hi = fsr_bounds(fsr_table[m].lambda_min, fsr_table[m].lambda_max, float(cut))
+        dc = disp_wcs[m]
+        sliced, sc = truncate_spectrum_iraf(np.asarray(data, dtype=np.float32),
+                                            dc.crval1, dc.cdelt1, lo, hi)
         if sliced.size == 0:
             return None
+        cards = {"CRVAL1": sc.crval1, "CRPIX1": sc.crpix1, "CDELT1": sc.cdelt1,
+                 "CD1_1": sc.cdelt1, "LTM1_1": sc.ltm1_1}
+        if sc.ltv1 is not None:
+            cards["LTV1"] = sc.ltv1
+        if sc.np2 is not None:
+            cards["NP2"] = str(sc.np2)
         return OrderSpectrum(
             order=m, fsr_cut=cut, flux=sliced.astype(np.float32),
-            crval1=float(wcs["crval1"]),
-            cdelt1=float(wcs["cdelt1"]),
-            crpix1=float(wcs["crpix1"]),
+            crval1=float(sc.w0), cdelt1=float(sc.wp), crpix1=1.0,
+            header_wcs=cards,
         )
 
     for cut in cfg.cutrange_list:
         for m, (data, hdr) in obj_dispcor.items():
-            spec = _fsr_cut(data, hdr, m, cut)
+            spec = _fsr_cut(data, m, cut)
             if spec is not None:
                 obj_out[(cut, m)] = spec
         for m, (data, hdr) in sky_dispcor_d.items():
-            spec = _fsr_cut(data, hdr, m, cut)
+            spec = _fsr_cut(data, m, cut)
             if spec is not None:
                 sky_out[(cut, m)] = spec
 
@@ -464,6 +991,9 @@ def _finalize_wavelength(
         sky=sky_out if cfg.flag_skyemission else None,
         intermediates=inter,
         meta=out_meta,
+        shift_wave=float(shift_wave),
+        obj_2d=obj_2d["strip"],
+        obj_2d_resample=obj_2d["resample"],
     )
 
 
@@ -1008,6 +1538,7 @@ def reduce_many(
     wavecal_verbose: bool = True,
     wavecal_diagnostic_pdf: str | Path | None = None,
     jobs: int = 1,
+    mode: str = "warp",
 ) -> TransitSeries:
     """Reduce a list of ``(obj, sky)`` frame pairs and align them in wavelength.
 
@@ -1023,7 +1554,8 @@ def reduce_many(
 
     Args:
         pairs: ``[(obj, sky), ...]`` — paths or arrays, as for :func:`reduce`.
-        refid: reference-frame index; default = the highest-flux frame.
+        refid: reference-frame index; default = WARP's choice (the frame with
+            the largest sum of per-order median counts, frame 0 for <= 2 frames).
         extract: ``"box"`` or ``"optimal"`` (applied to every frame).
         align: if False, skip shift measurement (shifts all 0) — useful to
             get the per-frame reductions without cross-frame alignment.
@@ -1041,10 +1573,17 @@ def reduce_many(
         jobs: number of worker processes for the expensive independent
             per-frame extraction stage. Series alignment, physical wavecal,
             and final writing remain single coordinated stages.
+        mode: ``"warp"`` (default) or ``"warp-reference"`` -- see
+            :func:`reduce`. With ``"warp"`` the per-frame reductions carry
+            only the 1-D intermediates (no 2-D frames or strips) and the
+            calibration-only work is cached across the frames;
+            ``"warp-reference"`` keeps every intermediate.
 
     Returns:
         A :class:`TransitSeries`.
     """
+    mode = resolve_mode(mode)
+    fast = mode == "warp"
     cfg = config or Config()
 
     def _finish(result: TransitSeries) -> TransitSeries:
@@ -1066,11 +1605,13 @@ def reduce_many(
         "extract": extract,
         "check_calib": check_calib,
         "subtract_background": subtract_background,
-        "save_intermediates": True,
+        "save_intermediates": not fast,
         "shift_wave": 0.0,
+        "mode": mode,
     }
     def _keep(reduction: Reduction) -> Reduction:
-        return reduction if save_intermediates else _release_2d_intermediates(reduction)
+        # mode="warp" keeps only the 1-D intermediates already.
+        return reduction if save_intermediates or fast else _release_2d_intermediates(reduction)
 
     if jobs == 1:
         base = [_keep(reduce(o, calib, sky=s, **reduction_kwargs)) for o, s in pairs]
@@ -1089,35 +1630,28 @@ def reduce_many(
         return _finish(result)
 
     orders = sorted(set.intersection(*[set(r.intermediates.spectra_1d) for r in base]))
-    # Truncated 1D per order per frame (the WARP `_m###c` cross-correlation input).
-    trunc: dict[int, list] = {m: [] for m in orders}
-    for r in base:
-        it = r.intermediates
-        for m in orders:
-            lam, dy = it.strip_wcs[m]
-            h = _astrofits.Header()
-            h["CRVAL1"] = lam; h["CDELT1"] = dy; h["CRPIX1"] = 1.0
-            t, _ = apply_waveshift_one_order(it.spectra_1d[m], h, shift_wave=0.0)
-            trunc[m].append(np.asarray(t, float))
-
-    ref_ord = 163 if 163 in orders else orders[len(orders) // 2]
-    if refid is None:
-        refid = int(np.argmax([np.nanmedian(trunc[ref_ord][i]) for i in range(n)]))
-    dy = base[0].intermediates.strip_wcs[orders[0]][1]   # common across orders
-    rows = []
-    for m in orders:
-        L = min(s.size for s in trunc[m])
-        rows.append(waveshift_one_order([s[:L] for s in trunc[m]], dy, refid=refid))
-    shift_avg, _, _, _ = waveshift_clip(np.array(rows))
+    # WARP's s10 exactly (warp/ccwaveshift.py): float32 search on the
+    # truncated _m###c spectra, WARP's reference frame and clipping; flagged
+    # frames are not shifted, as in WARP.
+    from decanter.waveshift.measure import warp_waveshift_log
+    rows = [[_truncated_c(r.intermediates, m) for r in base] for m in orders]
+    wlog = warp_waveshift_log(rows, orders, float(base[0].intermediates.strip_wcs[orders[0]][1]),
+                              measure=cfg.flag_wsmeasure, correct=cfg.flag_wscorrect,
+                              refid=refid)
+    refid = wlog.refid
+    shift_avg = np.asarray(wlog.waveShiftAdopted, dtype=float)
 
     aligned = []
     for r, sh in zip(base, shift_avg):
         it = r.intermediates
-        aligned.append(_finalize_wavelength(
+        red = _finalize_wavelength(
             it.spectra_1d, it.sky_1d, it.strip_wcs, r.obj_name, r.obj_path,
             r.sky_path, calib, cfg, it, shift_wave=float(sh),
-            save_intermediates=True, meta=r.meta,
-        ))
+            save_intermediates=True, meta=r.meta, fast=fast,
+        )
+        red.obj_header, red.sky_header = r.obj_header, r.sky_header
+        red.apertures, red.aperture_refs = r.apertures, r.aperture_refs
+        aligned.append(red)
     result = TransitSeries(reductions=aligned, shifts=shift_avg, refid=refid)
     return _finish(result)
 
