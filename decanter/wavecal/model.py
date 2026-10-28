@@ -1743,7 +1743,21 @@ def _xcorr_init(sset: SpectrumSet, template, lines: LineTable, cfg: AnchorConfig
         model = _hp_rows(model[None, :], width)[0]
         cc = _xcorr_lags(model, ref_obs[None, :], Lg)[0]
         totg += cc / (np.linalg.norm(model) * np.linalg.norm(ref_obs) + 1e-30)
-    d_glob = float(_peak(totg[None, :], dv)[0])
+    # a peak that runs into the search edge is not a solution (pi Men: weak OH in 30 s
+    # exposures, the edge at -40 km/s beat the real peak at +1.9): take the best INTERIOR
+    # local maximum, at least one FWHM from either edge
+    k = max(1, math.ceil(fw / dv))
+    inner = np.full_like(totg, -np.inf)
+    inner[k:-k] = totg[k:-k]
+    loc = np.r_[False, (inner[1:-1] >= inner[:-2]) & (inner[1:-1] >= inner[2:]), False]
+    j = int(np.argmax(np.where(loc, inner, -np.inf))) if loc.any() else Lg
+    if np.argmax(totg) != j:
+        warnings.warn(f"global line-list offset: the correlation maximum is at the search edge "
+                      f"({(np.argmax(totg) - Lg) * dv:+.1f} km/s); using the interior peak "
+                      f"({(j - Lg) * dv:+.1f} km/s)", stacklevel=3)
+    win = np.full_like(totg, -np.inf)
+    win[max(j - 1, 0):j + 2] = totg[max(j - 1, 0):j + 2]
+    d_glob = float(_peak(win[None, :], dv)[0])
     return drift, d_glob, dv, good
 
 
