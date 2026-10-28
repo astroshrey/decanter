@@ -25,7 +25,7 @@ under ``<OBJ>_NO<i>/intermediate_files/{OBJ/4-OBJ_mask,SKY/2-SKY_mask}/``.
 Parity: 0 differing float32 pixels vs WARP on TOI2109_decanterref NO1
 (object and sky) and on all AUMic / GJ3090 object frames; the AUMic /
 GJ3090 sky frames (no WARP ``_fm`` saved) match ``iraf.fixpix`` run
-through pyraf. See ``docs/BITEXACT.md``.
+through pyraf.
 """
 
 from __future__ import annotations

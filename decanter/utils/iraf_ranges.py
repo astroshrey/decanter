@@ -5,7 +5,7 @@
 ``sample`` goes through (``ic_dosetup``: ``rg_xranges`` + ``rg_order`` +
 ``rg_merge``).  Ported from the f2c C of this Mac's iraf-community v2.18.1
 build and checked against the compiled ``ctod_`` / ``ctor_`` /
-``rg_xrangesr_`` (docs/BITEXACT.md, "WARP's parameter-file options").
+``rg_xrangesr_``.
 
 The part that matters for WARP: ``rg_xadd`` reads a token's second number
 with ``rval2 = rval1; ctor (str, j, rval2)`` and ignores the return value,

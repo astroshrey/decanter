@@ -58,5 +58,4 @@ decanter.reduce_to_warp_tree("TOI836.txt", "science_data/2025_02_15",
 
 Both match WARP bit for bit, except for WARP's own uninitialised last pixel in
 some FSR cuts. Bit-identity is defined on Apple silicon (arm64), where the
-WARP references were made. Details: [docs/BITEXACT.md](docs/BITEXACT.md) and
-[docs/VECTORISED.md](docs/VECTORISED.md).
+WARP references were made.

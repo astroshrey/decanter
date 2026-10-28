@@ -54,8 +54,8 @@ _OBJNAME_BAD_CHARS: tuple[str, ...] = (" ", "'", "\"", "#", "/")
 
 # Reduction recipes. "warp" (the default) is the WARP clone run by the
 # vectorised, calibration-cached implementation (decanter.fast); it gives
-# warp-reference's bits (docs/VECTORISED.md). "warp-reference" is the scalar,
-# stage-by-stage exact port, kept for verification (docs/BITEXACT.md).
+# warp-reference's bits. "warp-reference" is the scalar,
+# stage-by-stage exact port, kept for verification.
 MODES: tuple[str, ...] = ("warp", "warp-reference")
 
 
@@ -267,15 +267,13 @@ def reduce(
             (:mod:`decanter.fast`; the rectification runs on the Apple GPU via
             MLX when available): bit-identical to WARP from s07 on, and to
             ``"warp-reference"`` everywhere except, on the MLX backend, float32
-            subnormals in s06 strip pixels the extraction never reads
-            (``docs/VECTORISED.md``). Only the extraction band of each rectified
+            subnormals in s06 strip pixels the extraction never reads. Only the extraction band of each rectified
             strip is evaluated (the rest is NaN) unless
             ``save_intermediates=True``, ``extract="optimal"`` or
             ``subtract_background=True``, which rectify whole strips; the 1-D
             extractions (``intermediates.spectra_1d`` / ``sky_1d`` /
             ``strip_wcs``) are always kept. ``"warp-reference"`` is the scalar,
-            stage-by-stage exact port (slow; for verification,
-            ``docs/BITEXACT.md``). Any other value raises ``ValueError``.
+            stage-by-stage exact port (slow; for verification). Any other value raises ``ValueError``.
         extract: 1D extraction method. ``"box"`` (default) is the WARP-parity
             box sum; ``"optimal"`` is Horne (1986) profile-weighted extraction
             (higher SNR, an algorithmic upgrade over WARP — see
@@ -309,7 +307,7 @@ def reduce(
     ``CUTRANSFORM flux: yes`` (any case, or ``y``) multiplies the rectified
     strips by the transform's Jacobian; ``Extract 2d spectrum: yes`` adds the
     2-D spectra (``Reduction.obj_2d`` and ``Reduction.obj_2d_resample``). All
-    three follow WARP bit for bit (docs/BITEXACT.md).  Every IRAF task port
+    three follow WARP bit for bit.  Every IRAF task port
     reads its input images as IRAF's FITS kernel does (``-0.0``,
     subnormals, ``+-Inf``/NaN -> ``+0``; :mod:`decanter.utils.iraf_imio`).
 
@@ -487,7 +485,7 @@ def reduce(
         # The background regions and the 2-D strips (resample2Dspec reads
         # twice the aperture around the trace) can read off-band pixels,
         # where the MLX backend's float32 subnormals may differ from WARP
-        # (docs/VECTORISED.md): with those options rectify on the CPU (exact).
+        # with those options rectify on the CPU (exact).
         rect_backend = "numpy" if warp_opts else None
         rect = _fast_rectify.rectify_orders_multi(
             [sscfm_in] + ([fm_in] if fm_in is not None else []), apset_multi,

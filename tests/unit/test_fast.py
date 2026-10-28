@@ -4,7 +4,7 @@ vectorised implementation in :mod:`decanter.fast`).
 Kernel tests run on synthetic data; the end-to-end checks against the scalar
 reference port (``mode="warp-reference"``) use the TOI2109 WARP ``-s``
 reference reduction and skip without it. The default is bit-identical to the
-reference port (``docs/VECTORISED.md``); the MLX backend's identity is an
+reference port; the MLX backend's identity is an
 observation about the Metal compiler, tested here too.
 """
 from __future__ import annotations
@@ -307,7 +307,7 @@ def test_dispcor_edges_fast_identical():
 # --- s02 CR mask: WARP factor map, vectorised (synthetic) ------------------------
 
 # The emulation reproduces NumPy's float32 reductions as built for arm64 (the
-# machine WARP's references were made on, docs/BITEXACT.md); x86 NumPy builds
+# machine WARP's references were made on); x86 NumPy builds
 # vectorise these reductions differently.
 _ARM64_ONLY = pytest.mark.skipif(
     platform.machine().lower() not in ("arm64", "aarch64"),

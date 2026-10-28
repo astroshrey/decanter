@@ -17,7 +17,7 @@ shift, same dispcor grid and FSR cuts as the scalar reference port
 
 Everything else (s01, s03-s05, s07 center search, s10, s11, s13) is the
 reference port's own code. The results are bit-identical to
-``mode="warp-reference"`` (``docs/VECTORISED.md``; on the MLX backend up to
+``mode="warp-reference"`` (on the MLX backend up to
 float32 subnormals in s06 strip pixels the extraction never reads).
 
 Backends: s06 runs on the Apple GPU through MLX when ``mlx`` imports and has a

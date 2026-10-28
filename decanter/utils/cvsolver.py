@@ -1,7 +1,6 @@
 """IRAF ``math/curfit`` port — Cholesky-banded Legendre/Chebyshev LSQ solver.
 
-Note: the arithmetic here is not fused the way the compiled IRAF is (see
-docs/BITEXACT.md), so it lands float32 ULPs away from IRAF; the bit-exact
+Note: the arithmetic here is not fused the way the compiled IRAF is, so it lands float32 ULPs away from IRAF; the bit-exact
 REAL curfit used by s03 is :mod:`decanter.utils.icfit_exact`.
 
 Bit-for-bit faithful Python port of IRAF's curfit module for

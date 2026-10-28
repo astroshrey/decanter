@@ -979,9 +979,8 @@ def reduce_to_warp_tree(
         dest_dir: output root (``reductions/<testname>``). Must not exist
             unless ``overwrite`` (then it is replaced).
         mode: reduction recipe passed to :func:`decanter.reduce`: ``"warp"``
-            (default: the WARP clone, vectorised and GPU-accelerated;
-            ``docs/VECTORISED.md``), ``"warp-reference"`` (its scalar reference
-            implementation, ``docs/BITEXACT.md``). The tree is the same for every mode; each spectrum's
+            (default: the WARP clone, vectorised and GPU-accelerated), ``"warp-reference"`` (its scalar reference
+            implementation). The tree is the same for every mode; each spectrum's
             ``DECANTER`` card names the mode and
             ``reduction_log/decanter_provenance.json`` the implementation and
             backend that ran.
@@ -1075,7 +1074,7 @@ def reduce_to_warp_tree(
         if fast_backend == "mlx" and (save or background_mode(cfg) != "none"
                                       or cfg.flag_extract2d):
             # The MLX rectification differs from WARP in float32 subnormals of
-            # strip pixels outside every extraction band (docs/VECTORISED.md);
+            # strip pixels outside every extraction band;
             # -s writes those whole strips, and the background regions and
             # 2-D strips may read them, so rectify on the CPU (exact).
             fast_backend = "numpy"
