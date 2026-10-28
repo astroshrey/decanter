@@ -326,3 +326,225 @@ def run(
         flag=flag,
     )
     table.save_npz(workdir / "waveshift_log.npz")
+
+
+# ---------------------------------------------------------------------------
+# WARP-exact cross-frame shift (``warp/ccwaveshift.py``), bit for bit.
+#
+# The functions above are a float64 re-implementation. WARP itself runs the
+# search in float32: the spectra are the float32 ``_m###c`` FITS data, the
+# medians/normalisations/residuals stay float32 under NumPy 2 promotion, and
+# the residual mean is NumPy's pairwise float32 sum. The argmin over the
+# 0.01-pixel grid is only stable against WARP if the arithmetic is the same,
+# so the functions below call the very same numpy/scipy operations on the
+# very same dtypes.
+# ---------------------------------------------------------------------------
+
+def warp_cc_spec_subp_sampling(
+    sp1y: NDArray[np.float32],
+    sp2y: NDArray[np.float32],
+    cshift: float,
+    width: float,
+    step: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float32]]:
+    """``warp/ccwaveshift.py:cc_spec_subp_sampling`` (ver 2.3).
+
+    ``sp1y`` is the reference spectrum after WARP's ``PySpecshift(sp1, tmp,
+    0.)`` (scopy + specshift 0 + scombine onto its own grid, which IRAF
+    short-circuits to a copy), ``sp2y`` the raw ``_m###c`` data of the other
+    frame; both float32.
+    """
+    import scipy.ndimage
+
+    sp1y = np.asarray(sp1y, dtype=np.float32)
+    sp2y = np.asarray(sp2y, dtype=np.float32)
+    normalization_sp2 = np.median(sp2y)
+    sp1y_norm = sp1y / np.median(sp1y)
+    div = 100
+    ec_short = 800
+    ec_long = 300
+    naxis1 = len(sp1y)
+    start_sp1 = int(naxis1 / div)
+    end_sp1 = int(naxis1 / div * (div - 1))
+    shiftnum = int(width / step * 2 + 1)
+    shift = [cshift - width + float(i) * step for i in range(shiftnum)]
+    dify = []
+    for i in range(shiftnum):
+        sp2y_shifted = scipy.ndimage.shift(sp2y, shift[i], order=3)
+        sp2y_norm_shifted = sp2y_shifted / normalization_sp2
+        tmpydif = (sp1y_norm[start_sp1 + ec_short:end_sp1 - ec_long]
+                   - sp2y_norm_shifted[start_sp1 + ec_short:end_sp1 - ec_long]) ** 2.
+        dify.append(np.average(tmpydif))
+    return np.array(shift), np.array(dify)
+
+
+def warp_waveshift_oneorder(
+    spectra: list[NDArray[np.float32]],
+    refid: int,
+    cdelt1: float,
+) -> list[float]:
+    """``warp/ccwaveshift.py:waveshift_oneorder``: shift (Å) of every frame.
+
+    Args:
+        spectra: per-frame float32 ``_m###c`` spectra of one order.
+        refid: reference frame index (its entry stays exactly 0.0).
+        cdelt1: the reference file's CDELT1 as WARP reads it (float).
+    """
+    wshift_vec: list = [0.0 for _ in range(len(spectra))]
+    sp1y = np.asarray(spectra[refid], dtype=np.float32)
+    for i in range(len(spectra)):
+        if i == refid:
+            continue
+        sp2y = np.asarray(spectra[i], dtype=np.float32)
+        shift_1, dify_1 = warp_cc_spec_subp_sampling(sp1y, sp2y, 0.001, 2.0, 0.5)
+        cshift_p = shift_1[np.argmin(dify_1)]
+        shift_2, dify_2 = warp_cc_spec_subp_sampling(sp1y, sp2y, cshift_p, 0.4, 0.1)
+        cshift_sp = shift_2[np.argmin(dify_2)]
+        shift_3, dify_3 = warp_cc_spec_subp_sampling(sp1y, sp2y, cshift_sp, 0.07, 0.01)
+        cshift_ssp = shift_3[np.argmin(dify_3)]
+        wshift_vec[i] = cshift_ssp * cdelt1
+    return wshift_vec
+
+
+def warp_waveshift_clip(wshift_matrix, objnum: int, aplength: int, sigma_1st=1.,
+                        sigma=2., iterate=5, stdthres=0.1):
+    """``warp/ccwaveshift.py:waveshiftClip`` (ver 2.3), verbatim."""
+    shift_average = []
+    shift_calcnum = []
+    shift_stddev = []
+    with np.errstate(all="ignore"):
+        for i in range(objnum):
+            shiftvec = []
+            shiftclip = np.array([0 for jj in range(aplength)])
+            for j in range(aplength):
+                shiftvec.append(wshift_matrix[j][i])
+            shiftvecarray = np.array(shiftvec)
+            for k in range(iterate):
+                shift_average_ite = np.average(shiftvecarray[shiftclip == 0])
+                shift_std_ite = np.std(shiftvecarray[shiftclip == 0])
+                if k == 0:
+                    shiftclip[np.absolute(shiftvecarray - shift_average_ite)
+                              / shift_std_ite > sigma_1st] += 1
+                elif k != iterate - 1:
+                    shiftclip[np.absolute(shiftvecarray - shift_average_ite)
+                              / shift_std_ite > sigma] += 1
+            shift_average.append(shift_average_ite)
+            shift_stddev.append(shift_std_ite)
+            shift_calcnum.append(np.sum(shiftclip == 0))
+        shift_stddev_arr = np.array(shift_stddev)
+        shift_calcnum_arr = np.array(shift_calcnum)
+        wshift_flag = np.zeros(objnum)
+        wshift_flag[shift_stddev_arr > stdthres] += 1
+        wshift_flag[shift_calcnum_arr < aplength / 2] += 1
+    return shift_average, shift_calcnum, shift_stddev, wshift_flag
+
+
+def warp_reference_frame(spectra_by_order: list[list[NDArray[np.float32]]]) -> int:
+    """WARP's reference frame for the shift search (``Warp_sci.py`` s10).
+
+    ``counts[i] += np.median(spy)`` over orders (float32 under NumPy 2,
+    because the ``0.`` start is a weak Python float), then
+    ``refid = argmax(counts)`` when there are more than two frames, else 0.
+    """
+    nframes = len(spectra_by_order[0])
+    counts = [0. for _ in range(nframes)]
+    for i in range(nframes):
+        for row in spectra_by_order:
+            counts[i] += np.median(np.asarray(row[i], dtype=np.float32))
+    return int(np.argmax(counts)) if nframes > 2 else 0
+
+
+@dataclass(frozen=True)
+class WarpWaveshiftLog:
+    """Contents of WARP's ``reduction_log/waveshift_log.npz`` (``warp/logger.py``)."""
+
+    waveShift: NDArray          # (n_orders, n_frames) Å
+    waveShiftAve: NDArray       # (n_frames,)
+    waveShiftStd: NDArray
+    waveShiftNum: NDArray       # int
+    waveShiftAdopted: NDArray   # shift actually applied in s11
+    echelleOrder: NDArray
+    frameNum: int
+    refid: int
+    flag: NDArray
+
+    def save_npz(self, path: Path) -> None:
+        """Write the npz with WARP's keys (``warpLog.writeWaveshiftLogNpz``)."""
+        np.savez(path, waveShift=self.waveShift, waveShiftAve=self.waveShiftAve,
+                 waveShiftStd=self.waveShiftStd, waveShiftNum=self.waveShiftNum,
+                 waveShiftAdopted=self.waveShiftAdopted,
+                 echelleOrder=self.echelleOrder, frameNum=self.frameNum)
+
+    def save_text(self, path: Path) -> None:
+        """Write the text log (``warpLog.writeWaveshiftLogText``)."""
+        n = self.frameNum
+        title = "Log of Waveshift"
+        lines = ["#" * 72, "### %s %s" % (title, "#" * (72 - len(title) - 5)), "#" * 72, "",
+                 "# Pixel shift relative to 1st frame.", ""]
+        out = "\n".join(lines) + "\n"
+        out += "Files\t" + "".join("No.%d\t" % (i + 1) for i in range(n)) + "\n\n"
+        for j, m in enumerate(self.echelleOrder):
+            out += "m=%d\t" % m + "".join("%.4f\t" % self.waveShift[j][i] + "\t"
+                                          for i in range(n)) + "\n"
+        # WARP prints frameNum entries; the npz keeps whole lists (longer
+        # when a listfile line has several ws= tokens)
+        out += "\nAverage:\t" + "".join("%.4f\t" % self.waveShiftAve[i] for i in range(n))
+        out += "\nStd dev:\t" + "".join("%.4f\t" % self.waveShiftStd[i] for i in range(n))
+        out += "\nNumber of orders:\t" + "".join("%d\t" % self.waveShiftNum[i]
+                                                 for i in range(n))
+        out += "\n\nAdopted shift:\t" + "".join("%.4f\t" % self.waveShiftAdopted[i]
+                                               for i in range(n))
+        Path(path).write_text(out)
+
+
+def warp_waveshift_log(
+    spectra_by_order: list[list[NDArray[np.float32]]],
+    orders: tuple[int, ...] | list[int],
+    cdelt1: float,
+    *,
+    measure: bool = True,
+    correct: bool = True,
+    refid: int | None = None,
+    n_manual: int | None = None,
+) -> WarpWaveshiftLog:
+    """WARP's whole s10 block (``Warp_sci.py`` "Shift correction"), exactly.
+
+    Args:
+        spectra_by_order: ``[order][frame]`` float32 ``_m###c`` spectra.
+        orders: echelle orders, same order as ``spectra_by_order``.
+        cdelt1: CDELT1 of the ``_m###c`` files (0.5 for HIRES, 1.0 for WIDE).
+        measure / correct: WARP's ``flag_wsmeasure`` / ``flag_wscorrect``
+            (``Measure Shift`` / ``Correct Shift`` in the parameter file).
+        refid: override the reference frame (default: WARP's choice).
+        n_manual: the length of WARP's ``conf.waveshift_man`` (one entry per
+            listfile line, more when a line has several ``ws=`` tokens;
+            ``decanter.warptree.warp_flat_tokens``); WARP sizes its zero
+            lists by it (Warp_sci.py:622-631).  Default: the frame count.
+    """
+    nframes = len(spectra_by_order[0])
+    aplength = len(orders)
+    nman = nframes if n_manual is None else int(n_manual)
+    if nframes > 1 and measure:
+        if refid is None:
+            refid = warp_reference_frame(spectra_by_order)
+        wshift_matrix = [warp_waveshift_oneorder(row, refid, cdelt1)
+                         for row in spectra_by_order]
+        ave, num, std, flag = warp_waveshift_clip(wshift_matrix, nframes, aplength)
+        if correct:
+            cor = [ave[i] if flag[i] == 0 else 0. for i in range(nframes)]
+        else:
+            cor = [0. for _ in range(nman)]
+    else:
+        refid = 0 if refid is None else refid
+        wshift_matrix = [[0. for _ in range(nframes)] for _ in range(aplength)]
+        ave = [0. for _ in range(nman)]
+        std = [0. for _ in range(nman)]
+        num = [0 for _ in range(nman)]
+        cor = [0. for _ in range(nman)]
+        flag = np.zeros(nframes)
+    return WarpWaveshiftLog(
+        waveShift=np.array(wshift_matrix), waveShiftAve=np.array(ave),
+        waveShiftStd=np.array(std), waveShiftNum=np.array(num),
+        waveShiftAdopted=np.array(cor), echelleOrder=np.array(list(orders)),
+        frameNum=nframes, refid=int(refid), flag=np.asarray(flag),
+    )

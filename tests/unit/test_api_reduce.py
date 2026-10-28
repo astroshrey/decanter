@@ -35,6 +35,19 @@ def test_combine_rejects_empty() -> None:
         decanter.combine([])
 
 
+def test_comp_dy_raises_without_cdelt1_like_warp(tmp_path) -> None:
+    """dy is the comp CDELT1; WARP raises when it is missing, so must we."""
+    from decanter.api import _comp_dy
+    p = tmp_path / "comp.fits"
+    fits.PrimaryHDU(np.zeros((2, 2), np.float32)).writeto(p)
+    with pytest.raises(KeyError, match="CDELT1"):
+        _comp_dy(p)
+    h = fits.Header()
+    h["CDELT1"] = 1.0
+    fits.PrimaryHDU(np.zeros((2, 2), np.float32), header=h).writeto(p, overwrite=True)
+    assert _comp_dy(p) == 1.0
+
+
 @pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
 def test_reduce_many_aligns_and_combines() -> None:
     """reduce_many() aligns frames and combine() stacks them onto one grid.
@@ -73,9 +86,11 @@ def test_reduce_matches_warp_on_toi2109_decanterref_m163_fsr105() -> None:
     assert spec.flux.shape == warp_data.shape, (
         f"shape mismatch: decanter {spec.flux.shape} vs WARP {warp_data.shape}"
     )
-    assert abs(spec.crval1 - float(warp_hdr["CRVAL1"])) < 1e-3, (
-        f"CRVAL1 mismatch: decanter {spec.crval1} vs WARP {warp_hdr['CRVAL1']}"
-    )
+    # The header WCS decanter writes is WARP's, digit for digit (the
+    # OrderSpectrum crval1/crpix1 describe the REAL resampling grid instead).
+    text = {c.keyword: c.image[10:30].strip() for c in warp_hdr.cards}
+    for key in ("CRVAL1", "CRPIX1", "CDELT1", "CD1_1", "LTV1", "LTM1_1"):
+        assert spec.header_wcs[key] == text[key], (key, spec.header_wcs[key], text[key])
     diff = spec.flux.astype(np.float64) - warp_data
     medrel = float(np.median(np.abs(diff) / np.maximum(np.abs(warp_data), 1.0)))
     assert medrel < 1e-4, f"medrel too high: {medrel * 100:.4f}%"
@@ -141,6 +156,36 @@ def test_standalone_trace_matches_warp_locked() -> None:
     assert worst < 5e-3, f"standalone vs WARP-locked medrel too high: {worst * 100:.3f}%"
 
 
+def test_centersearch_abba_matches_warp() -> None:
+    """WARP's center-search abbaflag: no 'O' in NODPOS and NODPOS != 'NA'
+    (Warp_sci.py:395); a missing NODPOS reads as 'N/A', which is ABBA."""
+    from decanter.api import _centersearch_abba
+    assert _centersearch_abba("A1") and _centersearch_abba("B") and _centersearch_abba("N/A")
+    assert not _centersearch_abba("NA")
+    assert not _centersearch_abba("O") and not _centersearch_abba("OS")
+
+
+@pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
+def test_locked_path_without_db_for_an_order_solves_that_order() -> None:
+    """Locked extraction with no per-frame DB for one order falls back to the
+    center search for that order (it used to dereference a missing free-path
+    solution); every other order stays on WARP's DBs."""
+    import dataclasses
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", decanter.calib.LockedAperturesWarning)
+        full = decanter.Calibration.from_dir(_TOI_PYWARPREF)
+    part = dataclasses.replace(
+        full, trans_apdbs={m: p for m, p in full.trans_apdbs.items() if m != 163})
+    cfg = decanter.Config(selected_orders=(162, 163), reduce_full_data=False)
+    r_full = decanter.reduce(_RAW_OBJ, full, sky=_RAW_SKY, config=cfg)
+    r_part = decanter.reduce(_RAW_OBJ, part, sky=_RAW_SKY, config=cfg)
+    for cut in r_full.fsr_cuts:
+        assert np.array_equal(r_part.obj[(cut, 162)].flux, r_full.obj[(cut, 162)].flux)
+        assert np.isfinite(r_part.obj[(cut, 163)].flux).all()
+
+
 @pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
 def test_reduce_a_only_no_sky() -> None:
     """Reducing a single nod position (sky=None) works end to end.
@@ -156,7 +201,8 @@ def test_reduce_a_only_no_sky() -> None:
 
 
 def test_reduce_rejects_unimplemented_mode() -> None:
-    """Only mode='warp' exists today; other recipes raise before any I/O."""
+    """Only 'warp' (default), 'warp-reference' and the 'fast' alias exist; other
+    recipes raise before any I/O."""
     import pytest
 
     import decanter

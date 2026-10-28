@@ -29,7 +29,9 @@ from decanter.io import fits as _fits
 from decanter.io import headers
 from decanter.io.fsr import load as load_fsr
 from decanter.io.listfile import parse as parse_listfile
-from decanter.utils.iminterp import scombine_linear_poly5
+from decanter.utils.fpemu import iraf_ctod
+from decanter.utils.iminterp import shdr_linear
+from decanter.utils.iraf_imio import imio_read_real
 
 
 def _sanitize_objname(raw: str) -> str:
@@ -73,47 +75,99 @@ def truncate_spectrum(
     if cdelt1 == 0.0:
         return flux[:0], {"crval1": wave_lo, "cdelt1": cdelt1,
                           "crpix1": 1.0, "ltm1_1": 1.0, "ltv1": 0.0}
-    # IRAF fractional 1-indexed pixel positions.
-    l1 = (wave_lo - crval1) / cdelt1 + 1.0
-    dl = (wave_hi - crval1) / cdelt1 + 1.0
-    # Clamp to [1, NAXIS].
+    # WARP passes the bounds through pyraf as ``str(float)``; IRAF's clgetd
+    # parses them with ``ctod``.
+    wa = iraf_ctod(repr(float(wave_lo)))
+    wb = iraf_ctod(repr(float(wave_hi)))
+    # sa_sextract (t_sarith.x): output length + WCS from the DOUBLE bounds.
+    l1 = (wa - crval1) / cdelt1 + 1.0
+    l2 = (wb - crval1) / cdelt1 + 1.0
     l1 = max(1.0, min(float(n_in), l1))
-    dl = max(1.0, min(float(n_in), dl))
-    # IRAF ``nint`` = round-half-away-from-zero.
-    i1 = int(np.floor(l1 + 0.5))
-    i2 = int(np.floor(dl + 0.5))
-    if i2 < i1:
-        i1, i2, l1, dl = i2, i1, dl, l1
-    n_out = i2 - i1 + 1
-    if n_out <= 0:
-        return flux[:0], {"crval1": wave_lo, "cdelt1": cdelt1,
-                          "crpix1": 1.0, "ltm1_1": 1.0, "ltv1": 0.0}
-    # Wavelengths at the FRACTIONAL pixel positions (matches shdr_extract:1189).
-    w0_new = crval1 + (l1 - 1.0) * cdelt1
-    w1_new = crval1 + (dl - 1.0) * cdelt1
+    l2 = max(1.0, min(float(n_in), l2))
+    n_out = abs(int(np.floor(l2 + 0.5)) - int(np.floor(l1 + 0.5))) + 1
+    # shdr_extract: the data are resampled from the bounds as REAL, which
+    # can give a different pixel count n_r at a nint boundary.
+    r1 = (float(np.float32(wa)) - crval1) / cdelt1 + 1.0
+    r2 = (float(np.float32(wb)) - crval1) / cdelt1 + 1.0
+    r1 = max(1.0, min(float(n_in), r1))
+    r2 = max(1.0, min(float(n_in), r2))
+    n_r = abs(int(np.floor(r2 + 0.5)) - int(np.floor(r1 + 0.5))) + 1
+    w0_new = np.float32(crval1 + (r1 - 1.0) * cdelt1)
+    w1_new = np.float32(crval1 + (r2 - 1.0) * cdelt1)
+    rebinned = shdr_linear(flux, crval1, cdelt1, w0_new, w1_new, n_r)
+    if n_r < n_out:
+        # IRAF copies n_out values out of an n_r-long buffer: the tail is
+        # uninitialised heap memory in WARP (not reproducible). Repeat the
+        # last resampled value instead.
+        rebinned = np.concatenate(
+            [rebinned, np.repeat(rebinned[-1:], n_out - n_r)]).astype(np.float32)
+    elif n_r > n_out:
+        rebinned = rebinned[:n_out]
     if n_out > 1:
-        dw_new = (w1_new - w0_new) / (n_out - 1)
-        ltm1_1 = (dl - l1) / (n_out - 1)
+        dw_new = float(np.float32(np.float32(w1_new - w0_new) / np.float32(n_r - 1)))
+        ltm1_1 = (l2 - l1) / (n_out - 1)
     else:
         dw_new = cdelt1
         ltm1_1 = 1.0
-    # Resample input onto the new linear grid via poly5 (same scombine path).
-    rebinned = scombine_linear_poly5(
-        flux, crval1_in=crval1, cdelt1_in=cdelt1,
-        w1_out=w0_new, dw_out=dw_new, nw_out=n_out, flux=False,
-    )
-    # IRAF WCS: keep CRVAL = input's CRVAL, place that wavelength at the
-    # output's CRPIX, which is the fractional output-pixel index where
-    # wave = CRVAL_in. wave(x_out) = CRVAL_in + (x_out - CRPIX1) * CDELT_out;
-    # set wave(CRPIX1) = CRVAL_in → CRPIX1 = 1 - (l1 - 1) / LTM1_1.
-    crpix1 = 1.0 - (l1 - 1.0) / ltm1_1 if ltm1_1 != 0 else 1.0
-    # IRAF physical-vs-logical: x_phys = LTM1_1 * x_log + LTV1, with input
-    # pixel ``l1`` at output pixel 1.
+    # The resampled pixels sit on the REAL grid w0 + (x - 1) * dw that
+    # shdr_linear actually used (WARP's header encodes the same mapping with
+    # CRVAL = input CRVAL and a negative CRPIX).
     ltv1 = l1 - ltm1_1
     return rebinned, {
-        "crval1": crval1, "cdelt1": dw_new,
-        "crpix1": crpix1, "ltm1_1": ltm1_1, "ltv1": ltv1,
+        "crval1": float(w0_new), "cdelt1": dw_new,
+        "crpix1": 1.0, "ltm1_1": ltm1_1, "ltv1": ltv1,
+        "w0": float(w0_new),
     }
+
+
+def fsr_bounds(fsr_lo: float, fsr_hi: float, cutrange: float) -> tuple[float, float]:
+    """WARP's FSR cut bounds, in WARP's float arithmetic.
+
+    WARP equivalent: ``warp/Spec1Dtools.py:cut_1dspec``.
+    """
+    center = (fsr_lo + fsr_hi) / 2.
+    lo = (center - (center - fsr_lo) * cutrange)
+    hi = (center + (fsr_hi - center) * cutrange)
+    return lo, hi
+
+
+def truncate_spectrum_iraf(
+    flux: np.ndarray,
+    crval1_text: str,
+    cdelt1_text: str,
+    wave_lo: float,
+    wave_hi: float,
+):
+    """``scopy(w1=wave_lo, w2=wave_hi)`` of a ``dispcor`` output, IRAF-exact.
+
+    Unlike :func:`truncate_spectrum` this takes the input WCS as the header
+    *text* WARP's ``_csw`` file carries (IRAF re-reads it with ``ctod``),
+    takes the bounds through pyraf's 12-digit real-parameter text, maps
+    wavelengths to pixels through the MWCS transform, and returns the output
+    header WCS IRAF writes (:class:`decanter.wavelength.iraf_wcs.ScopyWCS`)
+    alongside the data.
+
+    IRAF equivalent: ``noao/onedspec/t_sarith.x:sa_1d`` / ``sa_sextract``
+    + ``smw/shdr.x:shdr_extract`` / ``shdr_linear``; see
+    :func:`decanter.wavelength.iraf_wcs.scopy_wcs`.
+
+    Returns ``(rebinned_flux, ScopyWCS)``.
+    """
+    from decanter.wavelength.iraf_wcs import scopy_wcs
+    sc = scopy_wcs(crval1_text, cdelt1_text, int(flux.size), wave_lo, wave_hi)
+    crval = iraf_ctod(crval1_text)
+    cdelt = iraf_ctod(cdelt1_text)
+    # the input as IRAF reads it (FITS kernel: utils/iraf_imio)
+    rebinned = shdr_linear(imio_read_real(flux), crval, cdelt, sc.w0, sc.w1, sc.n_r, mwcs=True)
+    if sc.n_r < sc.n:
+        # IRAF copies n values out of an n_r-long buffer: the tail is
+        # uninitialised heap memory in WARP (not reproducible). Repeat the
+        # last resampled value instead.
+        rebinned = np.concatenate(
+            [rebinned, np.repeat(rebinned[-1:], sc.n - sc.n_r)]).astype(np.float32)
+    elif sc.n_r > sc.n:
+        rebinned = rebinned[: sc.n]
+    return rebinned.astype(np.float32), sc
 
 
 def run(

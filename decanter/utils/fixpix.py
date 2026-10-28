@@ -1,140 +1,212 @@
-"""IRAF-fixpix-equivalent bad-pixel interpolation.
+"""Bit-exact port of IRAF ``proto.fixpix`` (``linterp=INDEF, cinterp=INDEF``).
 
-Replaces ``iraf.fixpix(image, mask, linterp="INDEF", cinterp="INDEF")``.
+WARP runs ``iraf.fixpix(image, mask, linterp="INDEF", cinterp="INDEF")``
+(``warp/badpixmask.py:pyfixpix``). The task is ``pkg/proto/t_fixpix.x``
+driving ``pkg/xtools/fixpix/xtfixpix.x:xt_fpinit`` (choose the
+interpolation axis) and ``xtfp.gx:xt_fpsr`` (interpolate, REAL images);
+the mask is read by ``ytpmmap.x:yt_pmimmap``. This module reproduces the
+compiled object code of those routines (iraf-community 2.18.1, clang -O2,
+arm64) bit for bit; it was validated against the real ``xtfixpix.o`` /
+``xtfp.o`` driven through ``scripts/iraf_oracle/fixpix_oracle.c``.
 
-Algorithm
----------
-For every masked pixel:
+Algorithm (as IRAF does it)
+---------------------------
+Mask. A non-pixel-list mask image is read as INTEGER (Fortran
+``int(real)``: truncation toward zero) and negative values are set to 0;
+any value > 0 is bad. The mask values themselves do not matter when both
+interpolation codes are INDEF.
 
-1. Measure the length of the contiguous bad-pixel run containing it
-   along the row (``x``) and along the column (``y``).
-2. Pick whichever axis has the **shorter** run — that's the axis along
-   which we'll have the smallest gap to bridge.
-3. Linearly interpolate from the nearest good pixels on that axis.
-   ``np.interp`` performs constant-value extrapolation when a run
-   touches the frame edge — degraded but defensible.
+Axis. ``xt_fpsinterp`` replaces every bad pixel by ``nc + n_line``, the
+length of its run of bad pixels along the line (the image row). ``xt_fpinit``
+then walks every column and compares that against the length ``n_col`` of the
+pixel's run along the column: ``n_line > n_col`` selects column
+interpolation, otherwise (ties included) line interpolation.
 
-Ties go to the row direction (``x``), matching IRAF's stated
-preference: "In the case of a square region, linear interpolation
-across the row is used."
+Interpolation (REAL arithmetic). For a line run with good end points at
+columns ``c1 < i < c2`` (1-based; ``c1 = 0`` / ``c2 = nc + 1`` when the run
+touches the edge)::
 
-The function takes a single ``mask`` as input — callers are expected to
-have already combined any static and per-frame masks (logical OR) before
-invoking this.
+    a = data[c1]                  (data[c2] if c1 < 1)
+    b = (data[c2] - a) / (c2 - c1)   (0 if c2 > nc)      # float32 / float(int)
+    val = a + b * (i - c1)        -> one fused multiply-add: fmaf(b, i-c1, a)
+
+and for a column run between good lines ``l1 < line < l2``::
+
+    c = data[l1]                  (data[l2] if l1 < 1)
+    if l2 <= nl: d = (data[l2] - c) / (l2 - l1); val = fmaf(d, line - l1, c)
+    else:        val = c
+
+The FMA pairing is from ``objdump -d`` of ``xtfp.o`` (``fsub; scvtf; fdiv;
+scvtf; fmadd`` for both branches) and confirmed by the oracle. End points are
+always good pixels, so the result depends only on the input image (no
+cascading through already-fixed pixels).
+
+Degenerate IRAF behaviour (never met by real WINERED masks; warned about):
+
+- a CVAL (column-interpolated) pixel whose whole column is bad is not
+  assigned: it receives the *stale* ``val`` of the previously fixed pixel in
+  raster order (a static local in the compiled code; 0 at process start).
+  That needs ``n_line > nl``, impossible for a square frame. Emulated.
+- a line-interpolated pixel in a fully bad line: the first such pixel of the
+  run is left unchanged, later ones read past the end of IRAF's line buffer
+  (unreproducible garbage). Needs ``n_col >= nc``: the whole frame bad along
+  both axes. Those pixels are left unchanged here.
 """
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from numpy.typing import NDArray
 
+from decanter.utils.fpemu import fma32
 
-def _axis_run_lengths(mask: NDArray[np.bool_], axis: int) -> NDArray[np.int32]:
-    """For each masked pixel, the length of its contiguous run along ``axis``.
+_f32 = np.float32
 
-    ``axis=1`` → run is along columns within a row (x-direction).
-    ``axis=0`` → run is along rows within a column (y-direction).
 
-    Unmasked pixels keep value 0.
+def iraf_bad_pixels(mask: NDArray) -> NDArray[np.bool_]:
+    """Bad-pixel boolean map the way IRAF reads a mask image.
+
+    ``yt_pmimmap`` reads the mask image as INTEGER (``int(real)`` truncates
+    toward zero), sets negatives to 0, and stores it in a pixel mask; any
+    value > 0 is a bad pixel. Boolean input is taken as-is.
     """
-    if axis == 0:
-        # Transpose so we can always work along axis 1, then transpose back.
-        return _axis_run_lengths(mask.T, axis=1).T
-
-    H, W = mask.shape
-    out = np.zeros((H, W), dtype=np.int32)
-
-    # Per-row Python loop; tolerable at 2048 rows.
-    for r in range(H):
-        row = mask[r]
-        if not row.any():
-            continue
-        # Find run starts/ends via diff on a padded signed view.
-        padded = np.concatenate(([False], row, [False]))
-        diff = np.diff(padded.astype(np.int8))
-        starts = np.flatnonzero(diff == 1)
-        ends = np.flatnonzero(diff == -1)
-        for s, e in zip(starts, ends, strict=True):
-            out[r, s:e] = e - s
-    return out
+    m = np.asarray(mask)
+    if m.dtype == np.bool_:
+        return m.copy()
+    if np.issubdtype(m.dtype, np.floating):
+        m = np.trunc(m)
+    return m > 0
 
 
-def _axis_linear_interp(
-    image: NDArray[np.floating],
-    mask: NDArray[np.bool_],
-    axis: int,
-) -> NDArray[np.floating]:
-    """Linearly interpolate masked pixels along ``axis`` using good neighbors.
+def _runs(ys: NDArray[np.intp], xs: NDArray[np.intp]):
+    """Last good / first good positions bracketing each bad pixel's run.
 
-    ``axis=1`` → interpolate along x (within each row).
-    ``axis=0`` → interpolate along y (within each column).
-
-    Returns a new array with masked pixels replaced. Unmasked pixels are
-    unchanged.
+    ``(ys, xs)`` are bad-pixel coordinates sorted row-major (``xs`` along
+    the run axis). Returns 0-based ``(lo, hi)``: the good pixel before the
+    run (``-1`` at the edge) and after it (the axis length at the edge).
     """
-    out = image.copy()
-    if axis == 0:
-        # Recurse via transpose so we never branch the inner loop.
-        return _axis_linear_interp(image.T, mask.T, axis=1).T
-
-    H, W = image.shape
-    x_full = np.arange(W)
-    for r in range(H):
-        m = mask[r]
-        if not m.any():
-            continue
-        good = ~m
-        if good.sum() < 2:
-            # Whole row (or all-but-one) bad — np.interp would still
-            # work with 1 point (constant), but we explicitly leave the
-            # row alone here so the caller's cross-axis fallback can
-            # cover it.
-            continue
-        out[r, m] = np.interp(x_full[m], x_full[good], image[r, good]).astype(image.dtype)
-    return out
+    nb = ys.size
+    brk = np.ones(nb, dtype=bool)
+    if nb > 1:
+        brk[1:] = (ys[1:] != ys[:-1]) | (xs[1:] != xs[:-1] + 1)
+    starts = np.flatnonzero(brk)
+    ends = np.empty_like(starts)
+    ends[:-1] = starts[1:] - 1
+    ends[-1] = nb - 1
+    run_id = np.cumsum(brk) - 1
+    lo = xs[starts][run_id] - 1
+    hi = xs[ends][run_id] + 1
+    return lo, hi
 
 
 def fixpix(
     image: NDArray[np.floating],
-    mask: NDArray[np.integer | np.bool_],
-) -> NDArray[np.floating]:
-    """Interpolate over masked pixels along the narrower run axis.
+    mask: NDArray[np.integer | np.floating | np.bool_],
+) -> NDArray[np.float32]:
+    """IRAF ``fixpix(image, mask, linterp=INDEF, cinterp=INDEF)``, bit exact.
 
     Args:
-        image: 2-D float image.
-        mask: 2-D mask; any non-zero element is treated as a bad pixel.
+        image: 2-D image (``[line, column]``); computed as REAL (float32),
+            as IRAF does for a TY_REAL image.
+        mask: 2-D mask of the same shape. Boolean, or mask-image values
+            interpreted as IRAF does (see :func:`iraf_bad_pixels`).
 
     Returns:
-        A new image with bad pixels filled by linear interpolation. The
-        original array is not modified.
-
-    Notes:
-        For all-bad rows AND all-bad columns simultaneously, the
-        pixel is left at its original value. This is consistent with
-        IRAF's behavior of declining to fix unfixable runs.
+        A new float32 image with the bad pixels replaced. The input is not
+        modified.
     """
-    if image.shape != mask.shape:
+    data = np.asarray(image, dtype=_f32)
+    if data.ndim != 2:
+        raise ValueError(f"image must be 2-D, got shape {data.shape}")
+    if data.shape != np.shape(mask):
         raise ValueError(
-            f"image shape {image.shape} does not match mask shape {mask.shape}"
+            f"image shape {data.shape} does not match mask shape {np.shape(mask)}"
         )
-    bad = mask.astype(bool, copy=False)
+    out = data.copy()
+    bad = iraf_bad_pixels(mask)
     if not bad.any():
-        return image.copy()
+        return out
+    nl, nc = data.shape
 
-    row_runs = _axis_run_lengths(bad, axis=1)
-    col_runs = _axis_run_lengths(bad, axis=0)
+    # Bad pixels in raster (row-major) order: the order IRAF fixes them in.
+    ys, xs = np.nonzero(bad)
+    # Line runs (along x within a row).
+    c1, c2 = _runs(ys, xs)
+    # Column runs (along y within a column): work column-major, map back.
+    xs_c, ys_c = np.nonzero(bad.T)
+    l1_c, l2_c = _runs(xs_c, ys_c)
+    index = np.empty(bad.shape, dtype=np.intp)
+    index[ys, xs] = np.arange(ys.size)
+    perm = index[ys_c, xs_c]
+    l1 = np.empty_like(l1_c)
+    l2 = np.empty_like(l2_c)
+    l1[perm] = l1_c
+    l2[perm] = l2_c
 
-    row_interp = _axis_linear_interp(image, bad, axis=1)
-    col_interp = _axis_linear_interp(image, bad, axis=0)
+    use_col = (c2 - c1 - 1) > (l2 - l1 - 1)       # n_line > n_col (ties: line)
+    val = np.zeros(ys.size, dtype=_f32)
+    assigned = np.ones(ys.size, dtype=bool)
 
-    # Choose per-pixel: row wins on tie (IRAF's "square region uses row").
-    # `_axis_linear_interp` returns the original value when an axis is
-    # un-interpolable (< 2 good pixels on that axis), so a masked pixel
-    # whose row is un-interpolable will fall through to col_interp.
-    use_col = bad & (col_runs < row_runs)
-    use_row = bad & ~use_col
+    # --- line interpolation (xt_fpsr, FP_LVAL branch) ---------------------
+    L = ~use_col
+    if L.any():
+        y, x, a1, a2 = ys[L], xs[L], c1[L], c2[L]
+        left = a1 >= 0
+        right = a2 < nc
+        a = data[y, np.where(left, a1, np.minimum(a2, nc - 1))]
+        vr = data[y, np.minimum(a2, nc - 1)]
+        with np.errstate(invalid="ignore", over="ignore"):
+            b = np.where(right, (vr - a) / (a2 - a1).astype(_f32), _f32(0.0))
+            v = fma32(b, (x - a1).astype(_f32), a)
+        whole = ~left & ~right
+        if whole.any():
+            warnings.warn(
+                f"fixpix: {int(whole.sum())} line-interpolated pixel(s) in "
+                "fully bad lines; IRAF leaves the first unchanged and reads "
+                "past its buffer for the rest -- left unchanged here",
+                RuntimeWarning, stacklevel=2,
+            )
+            v = np.where(whole, data[y, x], v)
+            idx = np.flatnonzero(L)[whole]
+            assigned[idx] = False
+        val[L] = v
 
-    out = image.copy()
-    out[use_row] = row_interp[use_row]
-    out[use_col] = col_interp[use_col]
+    # --- column interpolation (xt_fpsr, FP_CVAL branch) -------------------
+    C = use_col
+    if C.any():
+        y, x, b1, b2 = ys[C], xs[C], l1[C], l2[C]
+        top = b1 >= 0
+        bottom = b2 < nl
+        c = data[np.where(top, b1, np.minimum(b2, nl - 1)), x]
+        vb = data[np.minimum(b2, nl - 1), x]
+        with np.errstate(invalid="ignore", over="ignore"):
+            d = (vb - c) / (b2 - b1).astype(_f32)
+            v = np.where(bottom, fma32(d, (y - b1).astype(_f32), c), c)
+        whole = ~top & ~bottom
+        if whole.any():
+            warnings.warn(
+                f"fixpix: {int(whole.sum())} column-interpolated pixel(s) in "
+                "fully bad columns; IRAF assigns them the stale value of the "
+                "previously fixed pixel (emulated)",
+                RuntimeWarning, stacklevel=2,
+            )
+            idx = np.flatnonzero(C)[whole]
+            assigned[idx] = False
+        val[C] = v
+
+    if not assigned.all():
+        # Stale ``val``: carry the last assigned value forward in raster order
+        # (0 before the first assignment, as a fresh IRAF process has it).
+        # Line-run "whole" pixels are left at the input value instead.
+        last = np.where(assigned, np.arange(ys.size), -1)
+        np.maximum.accumulate(last, out=last)
+        stale = ~assigned & use_col
+        src = last[stale]
+        val[stale] = np.where(src >= 0, val[np.maximum(src, 0)], _f32(0.0))
+        keep = ~assigned & ~use_col
+        val[keep] = data[ys[keep], xs[keep]]
+
+    out[ys, xs] = val
     return out

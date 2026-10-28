@@ -2,10 +2,9 @@ decanter
 ========
 
 A fast, pure-Python reduction pipeline for **WINERED** near-infrared echelle
-spectra. ``decanter`` reproduces WARP — the reference IRAF-based WINERED
-pipeline — to float32 precision across all three instrument modes (HIRES-Y,
-HIRES-J, WIDE), while running much faster and parallelizing trivially over
-frames.
+spectra. ``decanter`` is a clone of WARP — the reference IRAF-based WINERED
+pipeline — whose output is bit-identical to WARP's across all three
+instrument modes (HIRES-Y, HIRES-J, WIDE).
 
 Install
 -------

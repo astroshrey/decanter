@@ -32,11 +32,11 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
-import numpy as np
 from astropy.io import fits as _astrofits
 from numpy.typing import NDArray
 
 from decanter.utils.iminterp import scombine_linear_poly5
+from decanter.utils.iraf_imio import imio_read_real
 
 
 class TruncResult(NamedTuple):
@@ -102,7 +102,7 @@ def scopy_wavelength_truncate(
         )
 
     out_data = scombine_linear_poly5(
-        np.asarray(data, dtype=np.float32),
+        imio_read_real(data),          # the input as IRAF reads it (FITS kernel)
         crval1_in=crval1,
         cdelt1_in=cdelt1,
         w1_out=float(w1),

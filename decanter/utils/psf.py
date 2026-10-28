@@ -14,6 +14,7 @@ Python + SciPy + NumPy.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -242,3 +243,336 @@ def fit_slit_gaussian(
     except Exception:
         return PsfFit(xshift=float("nan"), fwhm=float("nan"), peak=float("nan"),
                       offset=float("nan"), n_rows_used=0, success=False)
+
+
+# ---------------------------------------------------------------------------
+# WARP-exact center search (bit-identical port of centersearch_fortrans)
+# ---------------------------------------------------------------------------
+
+def warp_trace_x(entry, array_length: int) -> NDArray[np.float64]:
+    """``warp/aperture.py:aperture.calculateTrace`` reproduced operation by operation.
+
+    WARP evaluates the trace with hand-rolled float64 recurrences
+    (``tracex += function(j) * coefficient[j]``, each ``function(j)`` rebuilding
+    the recurrence from scratch). numpy's ``chebval`` uses Clenshaw's algorithm,
+    which rounds differently; this reproduces WARP's order of operations.
+
+    Args:
+        entry: an :class:`~decanter.io.apdb.ApertureEntry` (values parsed with
+            Python ``float()``, exactly as WARP's ``apertureSet`` does).
+        array_length: number of rows (``NAXIS2`` of the trans strip).
+    """
+    ymin = entry.y_min
+    ymax = entry.y_max
+    tracey = np.arange(array_length) + 1.
+    tracex = np.zeros(array_length) + entry.center_x
+    norm = (2 * tracey - ymin - ymax) / (ymax - ymin)
+    legendre_ = entry.function_type == 2
+    if entry.function_type not in (1, 2):
+        raise ValueError(f"unknown aperture function type {entry.function_type}")
+    # p[n] of the recurrence; function(j) returns p[j] built from scratch, which
+    # is the same value as extending the recurrence once (identical operations).
+    p_prev2 = None
+    p_prev = None
+    for j in range(entry.poly_order):
+        if j == 0:
+            pj = 1.
+        elif j == 1:
+            pj = norm
+        elif legendre_:
+            pj = ((2 * j - 1) * norm * p_prev - (j - 1) * p_prev2) / j
+        else:
+            pj = 2 * norm * p_prev - p_prev2
+        tracex += pj * entry.coefficients[j]
+        p_prev2, p_prev = p_prev, pj
+    return tracex
+
+
+def default_warp_leastsq():
+    """The ``leastsq`` WARP's center search is reproduced with.
+
+    WARP calls ``scipy.optimize.leastsq``, so its fitted centers depend on the
+    scipy build it ran under: scipy <= 1.14 ships Fortran MINPACK, scipy 1.15
+    a C translation that stops ~1e-9 (relative) away. WARP runs in the same
+    venv as decanter, so the default (``DECANTER_WARP_MINPACK`` unset or
+    ``auto``, same as ``scipy``) is the installed ``scipy.optimize.leastsq``:
+    the very function a WARP run made today calls, whatever its version (on
+    this machine scipy 1.14.1 since 2026-10-19; TOI3486_decanterref and
+    WASP69_decanterref were made with it). ``DECANTER_WARP_MINPACK=c1153``
+    selects :func:`decanter.utils.minpack_exact.leastsq`, a bit-exact port of
+    scipy 1.15.3's compiled C MINPACK, for WARP reductions made under 1.15.3
+    (every archived one through 2026-10-19, e.g. TOI2109_decanterref) when
+    another scipy is installed. With scipy 1.15.3 installed the two agree.
+    The fitted floats differ between flavours, but the per-frame aperture
+    DBs (``%.2f`` tokens) were identical on all three ``_decanterref``
+    reductions, so the extracted spectra do not depend on the choice there.
+    """
+    import os
+
+    flavour = os.environ.get("DECANTER_WARP_MINPACK", "auto").strip().lower()
+    if flavour in ("auto", "scipy", ""):
+        from scipy.optimize import leastsq
+        return leastsq
+    if flavour not in ("c1153", "exact"):
+        raise ValueError(f"DECANTER_WARP_MINPACK={flavour!r}: use 'auto', 'scipy' or 'c1153'")
+    from decanter.utils.minpack_exact import leastsq
+    return leastsq
+
+
+def warp_minpack_label() -> str:
+    """What :func:`default_warp_leastsq` resolves to, e.g. ``"scipy 1.14.1"``
+    or ``"c1153"`` (for provenance)."""
+    import scipy
+
+    from decanter.utils.minpack_exact import leastsq as _c1153
+    return "c1153" if default_warp_leastsq() is _c1153 else f"scipy {scipy.__version__}"
+
+
+def _gaussianfunc_cs(p, x, c):
+    return math.sqrt(p[0] ** 2) * np.exp(-(x - p[1] - c) ** 2 / (2 * p[2] ** 2)) + p[3]
+
+
+def _residue_cs(p, y, x, c):
+    return y - _gaussianfunc_cs(p, x, c)
+
+
+def _warp_bin_medians(pf_x, pf_y, min_x, width, step):
+    """``np.median`` of ``pf_x`` / ``pf_y`` in each of WARP's ``step`` open bins.
+
+    WARP evaluates, per bin ``i``, ``np.median(v[(min + w*i < x) & (x < min + w*(i+1))])``
+    (open intervals; an empty bin gives NaN, a bin holding a NaN gives NaN).
+    This computes the identical values in one pass: the same boundary
+    expressions, membership by ``searchsorted``, and ``np.median`` on each bin's
+    elements in their original order.
+    """
+    bounds = np.array([min_x + width * i for i in range(step + 1)])
+    ok = ~np.isnan(pf_x)
+    j = np.searchsorted(bounds, pf_x, side="left")
+    member = ok & (j >= 1) & (j <= step)
+    jj = np.where(member, j, 1)
+    member &= pf_x < bounds[jj]
+    member &= pf_x > bounds[jj - 1]
+    # A stable sort by bin keeps each bin's elements in their original order,
+    # i.e. exactly the array WARP's boolean mask selects; np.median on it is
+    # then the very same computation (including NaN and signed-zero cases).
+    bins = (jj - 1)[member]
+    order = np.argsort(bins, kind="stable")
+    sb = bins[order]
+    counts = np.bincount(sb, minlength=step)
+    ends = np.cumsum(counts)
+    out = []
+    for vals in (pf_x[member][order], pf_y[member][order]):
+        med = np.full(step, np.nan)
+        for i in range(step):
+            if counts[i]:
+                med[i] = np.median(vals[ends[i] - counts[i]:ends[i]])
+        out.append(med)
+    return out[0], out[1]
+
+
+def warp_centersearch(
+    data: NDArray,
+    ref_entry,
+    *,
+    crval2: float,
+    cdelt2: float,
+    crpix2: float,
+    abba: bool,
+    leastsq=None,
+    profile: dict | None = None,
+) -> tuple[float, float]:
+    """Bit-exact port of ``warp/centersearch_fortrans.py:centersearch_fortrans``.
+
+    ``profile`` (optional dict) receives ``med_x``/``med_y``, the binned slit
+    profile WARP writes to ``images/spatial_profile/<strip>.dat``, when WARP
+    writes it (it is left empty when WARP gives up before that point).
+
+    Every array operation, dtype promotion (the trans strip is float32; WARP's
+    ``np.r_`` stacking upcasts to float64 after a float32 division) and median
+    is reproduced in WARP's order, and the Gaussian is fitted with MINPACK
+    ``lmdif`` through ``scipy.optimize.leastsq`` (the same call WARP makes).
+
+    Args:
+        data: the rectified ``_m###trans`` strip, shape ``(NAXIS2, NAXIS1)``;
+            cast to float32 (the dtype WARP read from the FITS file).
+        ref_entry: the multihole trans reference aperture
+            (``ap{aptrans}_{m}trans``) as an :class:`~decanter.io.apdb.ApertureEntry`.
+        crval2, cdelt2, crpix2: the strip's dispersion-axis WCS (FITS header
+            values, as astropy parses them).
+        abba: WARP's ``abbaflag`` (NODPOS has no ``O`` and is not ``NA``).
+        leastsq: the least-squares driver. Default
+            (:func:`default_warp_leastsq`): the installed
+            ``scipy.optimize.leastsq``, which is what WARP calls in the same
+            venv; ``DECANTER_WARP_MINPACK=c1153`` selects the bit-exact port of
+            scipy 1.15.3's C MINPACK for reductions made under that build.
+
+    Returns:
+        ``(xshift, fwhm)`` exactly as WARP logs them (``nan, nan`` when WARP
+        gives up on the order).
+    """
+    if leastsq is None:
+        leastsq = default_warp_leastsq()
+    trimg = np.asarray(data, dtype=np.float32)
+    naxis2, naxis1 = trimg.shape
+
+    lowlim = 500
+    upplim = 2048 - lowlim
+    step_sampling = 5
+    iterate = 3
+    distthres = 8.
+    center_width = 50
+    oposition = [-8, 8]
+
+    lowlim_ypix = int((lowlim - crval2) / cdelt2 + crpix2 - 1) - 1
+    upplim_ypix = int((upplim - crval2) / cdelt2 + crpix2 - 1)
+    center_ypix = int(((lowlim + upplim) / 2. - crval2) / cdelt2 + crpix2 - 1)
+
+    apx = warp_trace_x(ref_entry, naxis2)
+    ap_low = ref_entry.low
+    ap_high = ref_entry.high
+
+    apxlow = apx + ap_low - 1
+    apxlow_pix = apxlow.astype(np.int32)
+    apxlow_pix[apxlow_pix < 0] = 0
+    apxupp = apx + ap_high - 1
+    apxupp_pix = apxupp.astype(np.int32)
+    apxupp_pix[apxupp_pix > naxis1] = naxis1 - 1
+    apcenter = apx + (ap_low + ap_high) / 2.
+
+    # WARP builds the cut row for every one of the naxis2 rows; the rows are
+    # independent, so only the ones that are read are materialised here.
+    def cut_row(i):
+        cx = np.arange(apxlow_pix[i] + 1, apxupp_pix[i] + 1)
+        cy = trimg[i][apxlow_pix[i]:apxupp_pix[i]]
+        for _ in range(len(cx) - len(cy)):
+            cy = np.append(cy, 0.)
+        if abba:
+            ob = (cx < oposition[0] + apcenter[i] + 1) | (cx > oposition[1] + apcenter[i] + 1)
+            cx = cx[ob]
+            cy = cy[ob]
+        return cx, cy
+
+    centermax = [np.max(cut_row(center_ypix - center_width + i)[1])
+                 for i in range(0, 2 * center_width, step_sampling)]
+    if np.average(centermax) < 100.:
+        step_sampling = 1
+
+    ysample = np.arange(lowlim_ypix, upplim_ypix, step_sampling)
+    cut_x: dict = {}
+    cut_y: dict = {}
+    for i in ysample:
+        cut_x[i], cut_y[i] = cut_row(i)
+    maxid = np.array([np.argmax(cut_y[i]) for i in ysample])
+    maxpix = np.array([cut_x[ysample[i]][maxid[i]] for i in range(len(ysample))])
+    maxflux = np.array([cut_y[ysample[i]][maxid[i]] for i in range(len(ysample))])
+    maxdist = np.array([maxpix[i] - apx[ysample[i]] for i in range(len(ysample))])
+
+    dist_med = np.median(maxdist)
+    dist_clip = np.fabs(maxdist - dist_med) < distthres
+    flux_clip = (maxflux > np.median(maxflux) * 0.3) & (maxflux < np.median(maxflux) * 2.0)
+    for _ in range(iterate):
+        flux_med = np.median(maxflux[flux_clip])
+        flux_scat = np.std(maxflux[flux_clip])
+        flux_clip = flux_clip & (maxflux - flux_med > -1.5 * flux_scat) & (maxflux - flux_med < 4. * flux_scat)
+
+    if np.sum(np.logical_and(dist_clip, flux_clip)) > 0:
+        clip_array = np.logical_and(dist_clip, flux_clip)
+    elif np.sum(flux_clip) > 0:
+        clip_array = flux_clip
+    else:
+        return math.nan, math.nan
+
+    xs_parts = [np.array([])]
+    ys_parts = [np.array([])]
+    counter = 0
+    for i in range(len(ysample)):
+        if clip_array[i]:
+            y = ysample[i]
+            nocut_y = trimg[y][apxlow_pix[y]:apxupp_pix[y]]
+            nocut_x = np.arange(apxlow_pix[y] + 1, apxupp_pix[y] + 1)
+            xs_parts.append(nocut_x - apx[y])
+            ys_parts.append(nocut_y / maxflux[i])
+            counter += 1
+    if counter == 0:
+        return math.nan, math.nan
+    # np.r_ over the pieces == one concatenate (float64 result, same values).
+    pf_xdata = np.concatenate(xs_parts)
+    pf_ydata = np.concatenate([np.asarray(a, dtype=np.float64) for a in ys_parts])
+
+    min_xdata = np.amin(pf_xdata)
+    max_xdata = np.amax(pf_xdata)
+    step = 100
+    pf_width = (max_xdata - min_xdata) / float(step)
+    med_x, med_y = _warp_bin_medians(pf_xdata, pf_ydata, min_xdata, pf_width, step)
+    if profile is not None:
+        profile["med_x"] = med_x
+        profile["med_y"] = med_y
+
+    trimrange = int(8 / pf_width)
+    if abba:
+        medx_center = np.average(med_x)
+        oposbool2 = (med_x < oposition[0] + medx_center) | (med_x > oposition[1] + medx_center)
+        mid = np.argmax(med_y[oposbool2])
+        mpix = med_x[oposbool2][mid]
+        mid = np.where(med_x == mpix)[0][0]
+    else:
+        mid = np.argmax(med_y)
+        mpix = med_x[mid]
+
+    lowlim_trim = 0 if mid - trimrange < 0 else mid - trimrange
+    upplim_trim = len(med_x) if mid + trimrange > len(med_x) else mid + trimrange
+    med_xtrim = med_x[lowlim_trim:upplim_trim]
+    med_ytrim = med_y[lowlim_trim:upplim_trim]
+
+    p0 = [1., 0.1, 5., 0.01]
+    out = leastsq(_residue_cs, p0, args=(med_ytrim, med_xtrim, mpix), full_output=True)
+    centershift = out[0][1]
+    gwidth = math.fabs(out[0][2])
+    return centershift + mpix, gwidth * 2.3548
+
+
+def warp_slit_profile(
+    data: NDArray,
+    ref_entry,
+    *,
+    crval2: float,
+    cdelt2: float,
+    crpix2: float,
+) -> tuple[NDArray, NDArray]:
+    """Port of ``warp/centersearch_fortrans.py:make_slit_profile``.
+
+    WARP writes this profile to ``images/spatial_profile/<strip>.dat`` when
+    the center search gives up on an order (``nan``) and for every order in
+    manual-aperture mode: every 5th row of the reference window between
+    500 and 1548 A, each normalised by its own maximum, binned into 100
+    medians.  Returns ``(med_x, med_y)``.
+    """
+    trimg = np.asarray(data, dtype=np.float32)
+    naxis2, naxis1 = trimg.shape
+    lowlim = 500
+    upplim = 2048 - lowlim
+    step_sampling = 5
+    lowlim_ypix = int((lowlim - crval2) / cdelt2 + crpix2 - 1) - 1
+    upplim_ypix = int((upplim - crval2) / cdelt2 + crpix2 - 1)
+    apx = warp_trace_x(ref_entry, naxis2)
+    apxlow = apx + ref_entry.low - 1
+    apxlow_pix = apxlow.astype(np.int32)
+    apxlow_pix[apxlow_pix < 0] = 0
+    apxupp = apx + ref_entry.high - 1
+    apxupp_pix = apxupp.astype(np.int32)
+    apxupp_pix[apxupp_pix > naxis1] = naxis1 - 1
+    ysample = np.arange(lowlim_ypix, upplim_ypix, step_sampling)
+    xs_parts = [np.array([])]
+    ys_parts = [np.array([])]
+    for y in ysample:
+        nocut_y = trimg[y][apxlow_pix[y]:apxupp_pix[y]]
+        nocut_x = np.arange(apxlow_pix[y] + 1, apxupp_pix[y] + 1)
+        xs_parts.append(nocut_x - apx[y])
+        ys_parts.append(nocut_y / np.max(nocut_y))
+    pf_xdata = np.concatenate(xs_parts)
+    pf_ydata = np.concatenate([np.asarray(a, dtype=np.float64) for a in ys_parts])
+    min_xdata = np.amin(pf_xdata)
+    max_xdata = np.amax(pf_xdata)
+    step = 100
+    pf_width = (max_xdata - min_xdata) / float(step)
+    return _warp_bin_medians(pf_xdata, pf_ydata, min_xdata, pf_width, step)
