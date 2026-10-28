@@ -34,8 +34,10 @@ spec.wavelength, spec.flux       # vacuum-Å grid + flux (counts)
 A night's time series, every frame on its true telluric wavelength scale:
 
 ```python
-series = decanter.reduce_many(frame_pairs, calib)
+series = decanter.reduce_many(frame_pairs, calib)          # in memory
 series.wavecal.z_star            # km/s per frame: the correction applied
+
+decanter.reduce_many(frame_pairs, calib, workdir="out/")   # + FITS per frame
 ```
 
 A whole night written in WARP's layout (`reductions/<testname>/`), so anything

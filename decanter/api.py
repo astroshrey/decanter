@@ -1027,6 +1027,7 @@ def reduce_many(
     align: bool = True,
     mode: str = "default",
     waveshift: bool | None = None,
+    workdir: str | Path | None = None,
 ) -> TransitSeries:
     """Reduce a list of ``(obj, sky)`` frame pairs (one night) into a time series.
 
@@ -1050,6 +1051,10 @@ def reduce_many(
         waveshift: WARP's cross-frame shift: ``True`` on, ``False`` off,
             ``None`` (default) the mode's choice (``"default"``: off;
             ``"warp-clone"``: ``config``).
+        workdir: also write every frame's final spectra as FITS
+            (:meth:`Reduction.write_to`) into ``workdir/<object>_NO<i>/``, and
+            in the default mode the calibration (per-frame zero points, km/s)
+            to ``workdir/decanter_wavecal.json``.
 
     Returns:
         A :class:`TransitSeries` (``wavecal`` holds the solution in the
@@ -1057,6 +1062,39 @@ def reduce_many(
     """
     mode = resolve_mode(mode)
     cfg = _with_waveshift(config or Config(), waveshift, mode)
+    series = _reduce_series(pairs, calib, cfg, refid=refid, extract=extract,
+                            check_calib=check_calib, subtract_background=subtract_background,
+                            align=align, mode=mode)
+    if workdir is not None:
+        _write_series(series, Path(workdir))
+    return series
+
+
+def _write_series(series: TransitSeries, workdir: Path) -> None:
+    """``reduce_many(workdir=)``: one directory of final spectra per frame, plus
+    the default mode's calibration as JSON."""
+    import json
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    for i, r in enumerate(series.reductions, start=1):
+        r.write_to(workdir / f"{r.obj_name}_NO{i}")
+    sol = series.wavecal
+    if sol is not None:
+        def arr(a):
+            return None if a is None else [None if not np.isfinite(v) else float(v)
+                                           for v in np.asarray(a, float)]
+        rec = dict(method=sol.method, mode=sol.mode,
+                   frames=[f"{r.obj_name}_NO{i}" for i, r in enumerate(series.reductions, 1)],
+                   z_star_kms=arr(sol.z_star), z_star_err_kms=arr(sol.z_star_err),
+                   z_sky_kms=arr(sol.z_sky), z_sky_err_kms=arr(sol.z_sky_err),
+                   s11_shift_per_order=[{str(m): v for m, v in
+                                         (r.meta or {}).get("wavecal_shift", {}).items()}
+                                        for r in series.reductions])
+        (workdir / "decanter_wavecal.json").write_text(json.dumps(rec, indent=1))
+
+
+def _reduce_series(pairs, calib, cfg, *, refid, extract, check_calib, subtract_background,
+                   align, mode) -> TransitSeries:
     base = [
         reduce(o, calib, sky=s, config=cfg, extract=extract,
                check_calib=check_calib, subtract_background=subtract_background,

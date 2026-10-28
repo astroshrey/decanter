@@ -207,3 +207,20 @@ def test_reduce_rejects_unimplemented_mode() -> None:
     for bad in ("warp", "warp-reference", "fast"):
         with pytest.raises(ValueError, match="not a decanter mode"):
             decanter.reduce("obj.fits", None, mode=bad)
+
+
+@pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
+def test_reduce_many_workdir(tmp_path) -> None:
+    """reduce_many(workdir=) writes one directory of final spectra per frame and,
+    in the default mode, the wavelength calibration as JSON."""
+    import json
+
+    calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
+    cfg = decanter.Config(reduce_full_data=False, selected_orders=(159, 163))
+    series = decanter.reduce_many([(_RAW_OBJ, _RAW_SKY), (_RAW_SKY, _RAW_OBJ)], calib,
+                                  config=cfg, workdir=tmp_path)
+    for i, r in enumerate(series.reductions, start=1):
+        files = sorted((tmp_path / f"{r.obj_name}_NO{i}").glob("*_VAC.fits"))
+        assert len(files) == len(r.obj) + len(r.sky or {})
+    rec = json.loads((tmp_path / "decanter_wavecal.json").read_text())
+    assert len(rec["z_star_kms"]) == 2 and len(rec["s11_shift_per_order"]) == 2
