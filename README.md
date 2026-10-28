@@ -54,12 +54,6 @@ decanter.reduce_to_warp_tree("TOI836.txt", "science_data/2025_02_15",
 ## Modes
 
 - `mode="default"`: WARP's reduction without its cross-frame shift, then the
-  OH + telluric wavelength calibration ([docs](https://decanter.readthedocs.io/en/latest/wavelength.html))
-  applied in place. Not bit-identical to WARP; validated on 59 WARP nights.
+  OH + telluric wavelength calibration applied in place.
 - `mode="warp-clone"`: WARP to the bit, including its cross-frame
-  cross-correlation shift (s10/s11) as the parameter file sets it. Matches
-  WARP except for WARP's own uninitialised last pixel in some FSR cuts;
-  bit-identity is defined on Apple silicon (arm64), where the WARP references
-  were made.
-
-`waveshift=True/False` overrides WARP's cross-frame shift in either mode.
+  cross-correlation shift (s10/s11) as the parameter file sets it.
