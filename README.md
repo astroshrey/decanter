@@ -4,16 +4,17 @@
 [![docs](https://readthedocs.org/projects/decanter/badge/?version=latest)](https://decanter.readthedocs.io/en/latest/)
 
 A fast, pure-Python reduction pipeline for **WINERED** near-infrared echelle
-spectra. decanter is a clone of WARP
-([Hamano et al. 2024](https://arxiv.org/abs/2401.04876)) whose output is
-bit-identical to WARP's in all three instrument modes (HIRES-Y, HIRES-J, WIDE).
+spectra. decanter runs WARP's reduction
+([Hamano et al. 2024](https://arxiv.org/abs/2401.04876)) and, by default,
+calibrates every frame's wavelengths on the OH airglow and telluric H2O lines,
+so the spectra sit in the true telluric frame. A `warp-clone` mode reproduces
+WARP bit for bit in all three instrument modes (HIRES-Y, HIRES-J, WIDE).
 
 ## Install
 
 ```bash
-pip install -e .            # requires numpy, scipy, astropy
+pip install -e .            # numpy, scipy, astropy, jax
 pip install -e '.[mlx]'     # optional, Apple silicon: GPU rectification, same output
-pip install -e '.[wavecal]' # optional: physical wavelength calibration (JAX)
 ```
 
 ## Quickstart
@@ -30,54 +31,33 @@ spec = r.obj[(1.30, 163)]        # OrderSpectrum, keyed by (FSR cut, order)
 spec.wavelength, spec.flux       # vacuum-Å grid + flux (counts)
 ```
 
-A time series:
+A night's time series, every frame on its true telluric wavelength scale:
 
 ```python
 series = decanter.reduce_many(frame_pairs, calib)
+series.wavecal.z_star            # km/s per frame: the correction applied
 ```
 
-WARP's cross-frame wavelength shift (s10/s11, which moves every frame onto a
-reference frame's grid) is **off by default**, so each frame keeps its own
-ThAr scale and the telluric lines stay in their true frame. Pass
-`waveshift=True` to apply it as WARP does.
-
-A whole night written exactly as WARP writes it (`reductions/<testname>/`), so
-anything that reads WARP output works unchanged. Add `waveshift=True` (WARP's
-default) for a tree byte-identical to WARP's:
+A whole night written in WARP's layout (`reductions/<testname>/`), so anything
+that reads WARP output works unchanged; `reduction_log/` also gets the
+calibration (`decanter_wavecal.json`) and a before / after plot of a telluric
+line in every frame (`decanter_wavecal_telluric.png`):
 
 ```python
 decanter.reduce_to_warp_tree("TOI836.txt", "science_data/2025_02_15",
                              calib_dir, "reductions/TOI836",
-                             paramfile="nominal_params.txt", waveshift=True)
+                             paramfile="nominal_params.txt")
 ```
 
 ## Modes
 
-- `mode="warp"` (default): the WARP clone, vectorised and calibration-cached,
-  with the rectification on the Apple GPU when MLX is installed.
-- `mode="warp-reference"`: the slower stage-by-stage port it is checked against.
+- `mode="default"`: WARP's reduction without its cross-frame shift, then the
+  OH + telluric wavelength calibration ([docs/WAVECAL.md](docs/WAVECAL.md))
+  applied in place. Not bit-identical to WARP; validated on 59 WARP nights.
+- `mode="warp-clone"`: WARP to the bit, including its cross-frame
+  cross-correlation shift (s10/s11) as the parameter file sets it. Matches
+  WARP except for WARP's own uninitialised last pixel in some FSR cuts;
+  bit-identity is defined on Apple silicon (arm64), where the WARP references
+  were made ([docs/BITEXACT.md](docs/BITEXACT.md)).
 
-Both match WARP bit for bit, except for WARP's own uninitialised last pixel in
-some FSR cuts. Bit-identity is defined on Apple silicon (arm64), where the
-WARP references were made. Details: [docs/BITEXACT.md](docs/BITEXACT.md) and
-[docs/VECTORISED.md](docs/VECTORISED.md).
-
-## Physical wavelength calibration
-
-`decanter.wavecal` measures, frame by frame, where the atmosphere puts its
-lines on the ThAr scale: OH airglow in the sky spectra (the instrument) and
-telluric H2O in the object spectra (the starlight). It works on a night
-series, a single frame, or sparse RV epochs, and resamples only once.
-
-```python
-import decanter.wavecal as wc
-
-series = decanter.reduce_many(frame_pairs, calib)
-sol = wc.anchor_reduction(series, calib)
-sol.z_star, sol.z_star_err                  # km/s per object frame
-u = sol.labels(163, lam, kind="star")       # ln(lambda_true / lambda_label)
-flux = wc.export_resample(flux, lam, u, lam)
-```
-
-A WARP reduction works too: `wc.anchor(wc.load_warp_night("reductions/TOI2109"))`.
-The method and its validation are in the `decanter.wavecal.model` docstring.
+`waveshift=True/False` overrides WARP's cross-frame shift in either mode.

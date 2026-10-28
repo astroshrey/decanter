@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "decanter"
-version = "1.0.1"
+version = "1.1.0"
 description = "Pure-Python reduction pipeline for WINERED echelle spectra."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,6 +26,8 @@ dependencies = [
     "scipy>=1.10",
     "astropy>=5.3",
     "matplotlib>=3.7",
+    "jax>=0.4",
+    "jaxlib>=0.4",
 ]
 
 [project.optional-dependencies]
@@ -39,11 +41,6 @@ dev = [
 # (NumPy otherwise; the output is the same).
 mlx = [
     "mlx>=0.25; platform_system == 'Darwin' and platform_machine == 'arm64'",
-]
-# decanter.wavecal: the OH + telluric physical wavelength calibration.
-wavecal = [
-    "jax>=0.4",
-    "jaxlib>=0.4",
 ]
 docs = [
     "sphinx>=7",

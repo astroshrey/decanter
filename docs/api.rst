@@ -37,3 +37,16 @@ Configuration
 
 .. autoclass:: decanter.Config
    :members:
+
+Wavelength calibration
+----------------------
+
+.. autofunction:: decanter.wavecal.anchor
+
+.. autofunction:: decanter.wavecal.anchor_reduction
+
+.. autofunction:: decanter.wavecal.telluric_check
+
+.. autofunction:: decanter.wavecal.build_static_surface
+
+.. autofunction:: decanter.wavecal.export_resample

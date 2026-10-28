@@ -1250,6 +1250,7 @@ def reduce_to_warp_tree(
         _write_logs(rl, dest, ordered, orders, cfg, ctx, cal, ap_low, ap_high, wlog, lines,
                     lock_root is not None)
         if wavecal is not None:
+            wc_night = dataclasses.replace(wc_night, name=dest.name)
             _write_wavecal_log(rl, wavecal, wc_night, applied, ordered, plot=wavecal_check)
         for fut in night:
             fut.result()
