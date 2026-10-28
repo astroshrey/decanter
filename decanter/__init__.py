@@ -30,7 +30,7 @@ User-facing API:
 
 """
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 from decanter._reduction import Intermediates, OrderSpectrum, Reduction
 from decanter.api import TransitSeries, combine, reduce, reduce_many
