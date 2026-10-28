@@ -1,7 +1,6 @@
 """decanter.wavecal follow-up (block C2c): the conditioning guard of anchor_night's
 detector modes, A-only frames (no sky spectrum, no nod partner), the sparse-epoch model (one zero
-point + an A/B term [+ drift] per ABBA epoch) and the LineScale (one absolute scale for the
-static per-calibration-set files).  Real-data checks are marked ``regression`` and skip when the
+point + an A/B term [+ drift] per ABBA epoch).  Real-data checks are marked ``regression`` and skip when the
 WARP reductions / raw frames are absent.
 """
 from __future__ import annotations
@@ -17,10 +16,8 @@ jax = pytest.importorskip("jax")
 from decanter._localpaths import WINERED_ROOT  # noqa: E402
 from decanter.wavecal.model import (  # noqa: E402
     AnchorConfig,
-    LineScale,
     NightSpectra,
     SpectrumSet,
-    StaticSurface,
     ThArTemplate,
     _guard_modes,
     _mode_leverage,
@@ -28,8 +25,6 @@ from decanter.wavecal.model import (  # noqa: E402
     anchor_night,
     anchor_reduction,
     anchored_zero_points,
-    build_line_scale,
-    build_static_surface,
     choose_method,
 )
 from tests.unit.test_wavecal import COEF  # noqa: E402
@@ -256,8 +251,8 @@ def test_anchored_zero_points_design():
 
 def test_sparse_abba_epoch_model():
     """A 4-frame ABBA epoch: 'nod_drift' (one zero point + A/B term + drift) recovers the
-    injected per-frame zero points of sky and star; 'nod' on a drift-free epoch recovers the
-    zero point and the A/B term; 'frame' is the default (free per-frame zero points)."""
+    injected per-frame zero points of sky and star; 'frame' is the default (free per-frame zero
+    points)."""
     rng = np.random.default_rng(31)
     t = 60500.2 + np.arange(4) * (330.0 / 86400.0)
     nodc = np.array([0.5, -0.5, -0.5, 0.5])
@@ -286,151 +281,5 @@ def test_sparse_abba_epoch_model():
         zf = getattr(sols["frame"], f"z_{kind}")
         assert np.median(ez) <= np.median(getattr(sols["frame"], f"z_{kind}_err")) * 1.05
         assert abs(np.mean(z) - np.mean(zf)) < 0.02
-    # drift-free epoch: the 2-parameter model
-    zs0 = 0.5 + 0.10 * nodc
-    zt0 = 0.2 + 0.06 * nodc
-    n0 = _night(rng, t, zs0, zt0, shift=False, static=False, name="abba0")
-    n0 = NightSpectra(sky=SpectrumSet(kind="sky", lam=n0.sky.lam, flux=n0.sky.flux, time=t,
-                                      nod=n0.sky.nod, epoch=n0.sky.epoch),
-                      obj=n0.obj, template=n0.template, mode=n0.mode, name="abba0")
-    s0 = anchor(n0, AnchorConfig.for_mode("HIRES-Y", epoch_model="nod"), method="sparse")
-    co = s0.diagnostics["tell_epoch_coef"][0]
-    assert len(co["coef"]) == 2
-    assert abs(co["coef"][1] - 0.06) < 4 * co["err"][1] + 0.01
-    assert np.all(np.abs(s0.z_star - zt0) < 3 * s0.z_star_err + 0.02)
     with pytest.raises(ValueError):
-        anchor(n0, AnchorConfig.for_mode("HIRES-Y", epoch_model="bogus"), method="sparse")
-
-
-# ---------------------------------------------------------------------- line scale
-def _mock_solution(name, T, lines_lref, lines_order, mu, me, z_star, z_inst, kind="star"):
-    tab = dict(order=np.asarray(lines_order), lref=np.asarray(lines_lref), mu=np.asarray(mu),
-               mu_err=np.asarray(me), sigma=np.full(len(mu), 2.1), z=np.zeros(4),
-               species=np.full(len(mu), "H2O"), band=np.full(len(mu), "3-1"))
-    return SimpleNamespace(name=name, mode="HIRES-Y", template=T, method="sparse",
-                           config=AnchorConfig.for_mode("HIRES-Y"), tell=tab, oh=tab,
-                           star_modes=None, oh_modes=None, z_sky=np.zeros(4),
-                           z_star=np.full(4, z_star), z_inst=np.full(4, z_inst),
-                           diagnostics=dict(star_minus_inst_median=z_star - z_inst))
-
-
-def test_line_scale_one_absolute_scale(tmp_path):
-    """Two calibration sets (different ThAr templates: the same lines ~580 px apart, different
-    smooth template terms T_s) share per-line line-list errors.  The scale recovers the per-line
-    errors, files built on it give both sets the same label level (up to the one direction
-    line positions cannot fix: an x-slope common to every set, here < 0.03 km/s for a 580 px
-    setting change) and their per-line priors follow err + T_s; the convention is recorded."""
-    rng = np.random.default_rng(13)
-    TA, TB = _wide_template(0.0), _wide_template(20.0)       # another setting: lines ~580 px over
-    K = 160
-    om = rng.choice(np.r_[159:165, 177:184], K)
-    xA = rng.uniform(300, 3000, K)
-    lref = np.array([float(TA.lam(int(m), np.array([x]))[0]) for m, x in zip(om, xA, strict=True)])
-    err = rng.normal(0, 0.25, K)                              # line-list errors (shared)
-
-    def T_true(T, which, order, lam):
-        x = np.array([float(T.p_of_lam(int(m), np.array([v]))[0]) for m, v in zip(order, lam,
-                                                                                strict=True)])
-        xn = (2 * x - 4096.0) / 4094.0
-        mn = (2 * np.asarray(order, float) - (158 + 183)) / 25.0
-        return (0.30 * xn - 0.10 * mn + 0.20 * xn * mn) if which == "A" else \
-            (-0.20 * xn + 0.15 * mn - 0.10 * xn * mn)
-
-    sols = {"A": [], "B": []}
-    for which, T in (("A", TA), ("B", TB)):
-        tt = T_true(T, which, om, lref)
-        for n in range(4):
-            keep = rng.random(K) < 0.85
-            mu = err + tt + rng.normal(0, 0.03, K)
-            mu = mu - np.average(mu[keep])                   # each night: its own gauge
-            sols[which].append(_mock_solution(f"{which}{n}", T, lref[keep], om[keep], mu[keep],
-                                              np.full(keep.sum(), 0.02), -0.05, 0.0))
-    scale = build_line_scale(sols["A"] + sols["B"], kind="star", min_lines=20)
-    assert scale.n_sets.max() == 2 and len(scale.sets) == 2
-    c = np.corrcoef(scale.lookup(lref)[0], err - err.mean())[0, 1]
-    assert c > 0.95, c
-    p = scale.save(tmp_path)
-    s2 = LineScale.load(p)
-    assert np.array_equal(s2.err, scale.err) and s2.id == scale.id
-
-    def level(surf, T, which):
-        """Mean label error over a grid of 'stellar' positions for a frame whose telluric lines
-        sit at d_k = Z + T_true + err (Z = 0): z = mean(d - mu_prior), label = z + S."""
-        part = surf.star
-        from decanter.wavecal.model import _part_prior, _surface_at
-
-        d = T_true(T, which, om, lref) + err
-        mu_p, _v, matched = _part_prior(part, T, om, lref)
-        z = float(np.mean((d - mu_p)[matched]))
-        og = np.repeat(np.arange(159, 184), 9)
-        xg = np.tile(np.linspace(400, 3700, 9), 25)
-        lg = np.array([float(T.lam(int(m), np.array([x]))[0]) for m, x in zip(og, xg, strict=True)])
-        lab = z + _surface_at(part, xg, og)
-        return float(np.mean(lab - T_true(T, which, og, lg)))
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        fA, fB = build_static_surface(sols["A"]), build_static_surface(sols["B"])
-        gA = build_static_surface(sols["A"], scale=scale)
-        gB = build_static_surface(sols["B"], scale=scale)
-    assert fA.star["scale"]["kind"] == "set" and gA.star["scale"]["kind"] == "table"
-    assert gA.star["scale"]["id"] == scale.id and "HITRAN" in gA.star["scale"]["gauge"]
-    d_set = level(fA, TA, "A") - level(fB, TB, "B")
-    d_scale = level(gA, TA, "A") - level(gB, TB, "B")
-    assert abs(d_scale) < 0.03, (d_scale, d_set)
-    from decanter.wavecal.model import _part_prior
-
-    for g, T, which in ((gA, TA, "A"), (gB, TB, "B")):
-        mu_p, var_p, matched = _part_prior(g.star, T, om, lref)
-        truth = err + T_true(T, which, om, lref)
-        assert matched.all() and np.corrcoef(mu_p, truth)[0, 1] > 0.97
-        assert np.all(var_p > 0) and np.all(var_p < 0.1)
-    # a saved scaled surface keeps its convention
-    path = gB.save(tmp_path / "g.json")
-    s3 = StaticSurface.load(path)
-    assert s3.star["scale"]["kind"] == "table" and s3.version == 2
-    with pytest.raises(ValueError):
-        build_static_surface(sols["A"], scale={"sky": scale})
-
-
-def test_line_scale_overlap_lines_per_order():
-    """A line in the overlap of two echelle orders has one offset PER ORDER in the scale (HIRES-Y:
-    47 of 252 lines, 0.1-0.3 km/s apart at the order ends).  ``LineScale.lookup(lref, order)`` and
-    the files built on the scale keep each order's own offset (a wavelength-only lookup handed one
-    order's offset to the other on ~50 lines of every HIRES-Y file)."""
-    from decanter.wavecal.model import _part_prior
-
-    rng = np.random.default_rng(29)
-    T = _wide_template()
-    # an overlap line: in order 171 and inside order 170's pixel range too
-    p171 = np.linspace(5.0, 4090.0, 400)
-    lam171 = T.lam(171, p171)
-    p170 = T.p_of_lam(170, lam171)
-    ins = np.where((p170 > 150.0) & (p170 < 3950.0) & (p171 > 150.0) & (p171 < 3950.0))[0]
-    assert ins.size, "no overlap between orders 170 and 171 in the mock template"
-    lov = float(lam171[ins[ins.size // 2]])
-    K = 120
-    om = rng.choice(np.r_[159:169, 173:183], K)
-    lref = np.array([float(T.lam(int(m), np.array([x]))[0]) for m, x in
-                     zip(om, rng.uniform(300, 3800, K), strict=True)])
-    err = rng.normal(0, 0.15, K)
-    om = np.r_[om, 170, 171]
-    lref = np.r_[lref, lov, lov]
-    err = np.r_[err, 0.30, -0.30]                    # the same line, two order-end offsets
-    sols = []
-    for n in range(4):
-        mu = err + rng.normal(0, 0.01, err.size)
-        mu = mu - mu.mean()
-        sols.append(_mock_solution(f"ov{n}", T, lref, om, mu, np.full(err.size, 0.01), -0.05, 0.0))
-    scale = build_line_scale(sols, kind="star", min_lines=20)
-    e_ord, _sd, hit = scale.lookup([lov, lov], [170, 171])
-    assert hit.all() and abs((e_ord[0] - e_ord[1]) - 0.60) < 0.05, e_ord
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        g = build_static_surface(sols, scale=scale)
-    mu_p, _v, matched = _part_prior(g.star, T, np.array([170, 171]), np.array([lov, lov]))
-    assert matched.all() and abs((mu_p[0] - mu_p[1]) - 0.60) < 0.05, mu_p
-    # one entry per (order, line) in the file: no cross-order duplicates added
-    L = g.star["lines"]
-    keys = [(int(o), round(float(v), 3)) for o, v in zip(L["order"], L["lref"], strict=True)]
-    assert len(keys) == len(set(keys))
+        anchor(night, AnchorConfig.for_mode("HIRES-Y", epoch_model="nod"), method="sparse")

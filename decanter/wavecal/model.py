@@ -1,4 +1,4 @@
-"""Per-frame wavelength anchoring on extracted spectra (new fast mode, block C2; replaces s10).
+"""Per-frame wavelength anchoring on extracted spectra (replaces WARP's s10).
 
 What it does
 ------------
@@ -63,174 +63,11 @@ Conventions
   while its time and exposure id are the partner's.
 * ``epoch`` identifies the raw exposure (FRAMEID): per-exposure jitter is shared by every
   spectrum taken from the same exposure.
-* JAX float64 through :func:`decanter.wavecal._xp.get_backend` (``"jax", "float64"``) for
+* JAX float64 through JAX (``jax_enable_x64``) for
   everything that is fitted (centroids, decomposition, GP marginal likelihood);
   ``jax.lax``/``jax.jacfwd`` are used directly where the shim has no equivalent.
 
-Line list
----------
-``decanter/data/oh_h2o_vacuum_lines.txt`` (provenance in its header): HITRAN2020 OH positions
-(with the Oliva+2015 / Bernath & Colin 2009 positions as a cross-check column, HITRAN -
-Oliva = -21 m/s median), a two-temperature + per-v' population model for OH intensities,
-and H2O / O2 anchor candidates with HITRAN S, gamma_air, delta_air (pressure shift applied at
-run time, ``P_eff`` = 0.60 atm H2O, 0.38 atm O2) and modelled depth / blend metrics at
-R = 60k and 25k.
-
-Validation (WARP reductions, 2026-10-20; ``tests/unit/test_wavecal.py`` holds the
-synthetic and regression checks)
-------------------------------------------------------------------------------------------
-* OH per-frame zero point vs the ThAr-free study (scratchpad ``thar_free``): TOI-2109
-  0.013 km/s rms, TOI-3486 0.038, WASP-69 0.16 (WIDE, 45 s frames); absolute median
-  +0.084 / +0.533 / +10.55 km/s on the period ThAr scale (study +0.105 / +0.543 / +10.47;
-  the absolute value moves by up to 0.05 km/s with the mode basis).  Per-frame scatter
-  about the smooth drift + nod: 0.021 / 0.022 / 0.059 km/s.
-* Star vs OH drift slope (OLS): 1.056 +- 0.007 (TOI-2109), 0.78 +- 0.03 (TOI-3486),
-  1.074 +- 0.005 (WASP-69).  The study's 0.99 / 0.72 / 1.03 used fixed (non-tracking)
-  centroid windows, which bias drift slopes low (reproduced: 0.98-0.99 with fixed windows,
-  1.04-1.05 with tracking windows on the same TOI-2109 lines); WARP's own per-order s10
-  xcorr shifts give 0.90-1.07 (median 0.98) on TOI-2109's telluric orders, but the held-out
-  m163 residual does not correlate with the drift (slope +0.04 +- 0.03), i.e. ~1.05 holds.
-* Held-out orders (excluded from the star term), per-frame residual velocity of the
-  telluric cores after one Lanczos resample to the observatory frame, rms over the night,
-  s10 as delivered -> default labels ("auto" = 3 x 3 modes on these full nights):
-  TOI-2109 m160 / m163 / m181 0.92 / 0.91 / 0.90 -> 0.055 / 0.16 / 0.038 (m163 metric
-  noise floor ~0.14 by split-half; 28/42 frames zeroed by s10); TOI-3486 m133 / m140 /
-  m147 / m152 0.21 / 0.14 / 0.072 / 0.14 -> 0.11 / 0.13 / 0.080 / 0.097; WASP-69 m44 /
-  m52 / m59 0.80 / 0.69 / 0.41 -> 0.092 / 0.23 / 0.094 (m52 with 2 x 2 modes: 2.84 -> 0.13
-  on the four s10-zeroed frames).  2 x 2 modes: 1.20 km/s summed over the 10 orders vs 1.08.  He I
-  window (+-6 A) telluric-core residual rms, TOI-2109: 0.024 -> 0.0125 (continuum noise
-  0.013).
-* Robustness: blank / aborted frames (all-NaN or 2 % flux) leave the other frames' labels
-  within 0.5 sigma; the solution does not depend on the frame order; a missing FRAMEID
-  falls back to per-frame time ids (identical result on TOI-2109); corrupt UT-END is
-  replaced by EXPTIME (a corrupt EXPTIME alone is ignored).
-
-Single images and sparse epochs (block C2b)
--------------------------------------------
-:func:`anchor_night` needs a NIGHT: its time model (GP drift + nod, star tied to OH by
-``beta``) and its ``(x, m) x (drift, nod)`` modes are fitted across frames.  One exposure (a
-single RV spectrum, ``decanter.reduce``), or a few exposures on different nights (RV epochs),
-go through :func:`anchor_frames`.  :func:`anchor` chooses (:func:`choose_method`, overridable):
-one frame -> ``"single"``; one epoch with >= ``series_min_frames`` frames over
->= ``series_min_span_h`` h -> ``"series"`` (anchor_night, unchanged); else ``"sparse"``.
-:func:`anchor_reduction` takes ``decanter.Reduction`` output (one = single, a
-``TransitSeries`` night = series).
-
-* Every frame gets its own zero points: ``z_sky`` from the OH lines of its sky spectrum,
-  ``z_star`` from the telluric lines of its object spectrum (so the slit-illumination
-  offset of that exposure is included), ``z_inst`` = ``z_sky`` of the paired sky spectrum
-  (+ ``drift_rate_kms_h x |dt|`` in quadrature).  A frame with < ``min_lines_static``
-  telluric lines falls back to ``z_inst`` + the surface's slit prior.
-* A zero point is the GLS mean of ``d_k - mu_k`` over the frame's lines
-  (:func:`anchored_zero_points`): the per-line static offsets ``mu_k`` come from a
-  :class:`StaticSurface` of the calibration set (every epoch on the surface's absolute
-  scale), or without one from the epoch groups themselves (``"sparse"``, shared self prior)
-  or 0 (``"single"``: line-list gauge; the static offsets then count as noise and, as in
-  anchor_night, a ``sky_shape`` surface is fitted to the frame's own OH offsets).
-* Errors: the centroid errors scaled by a fitted ``lam`` plus an additive excess per epoch
-  group (per-line scatter is 2.5-3.7 x the formal error and correlates with it at 0.75-0.9),
-  Huber sandwich inflation for heavy tails.
-* Labels: ``z`` + the surface's static shape ``S(x, m)`` (sky: OH; star: tellurics) + its A/B
-  pattern ``nod x P(x, m)``.  The drift-dependent shape of anchor_night's modes is
-  night-specific and NOT applied by default (``use_surface_drift``).  Frame-to-frame z
-  values of two paths are only comparable through the labels (z alone absorbs the
-  line-weighted mean of whatever pattern is applied).
-
-The surface (:func:`build_static_surface`, :func:`surface_from_warp_reductions`;
-:meth:`StaticSurface.save` / ``load`` / ``find``) is built from one or more night solutions
-of ONE calibration set (ThAr template fingerprint), quality-gated per night, and stored as a
-small JSON file (:data:`SURFACE_FILENAME`, ~75 kB for 11 nights) inside the calibration set;
-a surface whose prior makes a frame's residuals worse than the bare line list is rejected at
-use time (warning); its A/B pattern is applied with it (``use_surface_modes``).
-
-Follow-up (block C2c, 2026-10-21; ``tests/unit/test_wavecal_follow.py``)
-------------------------------------------------------------------------------
-* Mode guard (:func:`_guard_modes`, ``modes_min_lines_per_term`` / ``modes_max_leverage``): a
-  detector-mode basis must have >= 2 lines per term and a maximum prediction leverage over the
-  detector <= 200, else ``(3, 3) -> (2, 2) -> (2, 1) -> none``.  TOI-270c's 13 telluric lines
-  (leverage 1.2e8) had a 3 x 3 star pattern swinging 654 km/s across the detector: now (2, 1),
-  0.26 km/s (labels sane everywhere; the unguarded labels made 25 of ~510 stellar lines
-  unusable).  The guard does NOT remove TOI-270c's ~0.1 km/s series RV offset: with one RV
-  template built from the guarded labels, the cross-epoch spread with TOI-270d/oct is
-  0.123 +- 0.015 km/s guarded, 0.028 +- 0.041 unguarded, 0.129 without star modes, 0.110 with
-  (2, 2), 0.027 for single frames (the earlier "0.395 -> 0.11" compared against a template
-  built from the unguarded labels).  It triggers on 5 of 52 nights on disk (TOI-270c, pi Men,
-  AU Mic, HD 136352, G 2938: 7-37 lines); the other 47 (incl. TOI-2109 / TOI-3486 / WASP-69,
-  leverage <= 80) are bit-identical in every solution field and label.
-* A-only frames (``night.sky is None``, e.g. ``decanter.reduce(sky=None)``): OH from the object
-  spectrum itself (``z_inst`` at dt = 0), features with contaminating OH / telluric lines in
-  their window excluded (``aonly_*``).  21 TOI-2109 A frames: ``z_inst`` - series OH model at
-  the exposure -0.001 +- 0.026 km/s (pull sd 0.94; the A-B partner's OH: 0.079 rms), ``z_star``
-  - the A-B frame's +0.020 +- 0.004 km/s (sd 0.017: a 5-sigma offset, cause not identified;
-  validated on an F star only - stellar lines in the OH windows are not excluded).  ``decanter.reduce(sky=None)`` extracts B-nod frames at
-  the A slit position (sky only), so only A-nod frames carry the star.
-* Epoch model (``epoch_model``, sparse path): ``"nod"`` (one zero point + A/B term per epoch) or
-  ``"nod_drift"`` (+ linear drift; ABBA makes nod and drift orthogonal) instead of free
-  per-frame zero points.  4-frame ABBA epochs on TOI-2109 / HD 3167 / GJ 3090 / TOI-3486 vs the
-  series: ``"nod"`` is biased per frame by the 20-min drift (star pull sd 1.7-3.1), ``"nod_drift"``
-  matches ``"frame"`` (0.038-0.047 km/s rms) with smaller errors; epoch means agree.
-* One absolute scale (:class:`LineScale`, :func:`build_line_scale`, ``build_static_surface(
-  scale=)``): per-line offsets ``err_k`` shared by every calibration set + a smooth term per set,
-  fitted over all nights of a mode; files record ``part["scale"]``.  Cross-epoch RV spread with
-  files from other nights only (scale without the target's nights), per-set gauge -> one scale:
-  TOI-969 (two sets) 0.042 -> 0.014 km/s (no file 0.010), TOI-270 0.030 -> 0.023, HD 3167 0.084
-  -> 0.092, GJ 3090 0.020 -> 0.023 (TOI-270: the files are rejected on 7-13 of each night's
-  frames).  An x-slope common to every set is not fixed by line positions (~0.01 km/s per
-  600 px setting shift).  The offsets are per (order, line): :meth:`LineScale.lookup` takes
-  the order (a wavelength-only lookup gave ~50 overlap lines per file the other order's offset,
-  moving a file's level by ~0.007 km/s).
-* Cross-epoch anchor (HD 3167, GJ 3090, TOI-969, TOI-270, LTT 9779): telluric zero points carry
-  0.03-0.04 km/s per-epoch systematics (HD 3167: star - OH moves 0.13-0.17 km/s between two
-  nights, depth dependent: weak lines 0.35, deep 0.12-0.14; not stellar blends (0.01 km/s with
-  a K1V template divided out), not a resolved pressure shift (dP_eff = 0.14 +- 0.10 atm), not
-  the drift pattern (< 0.02)).  OH zero points (+ a constant slit term) are consistent to
-  ~0.01 km/s on 4 of 5 targets (chi2 0-4.4 for 1 dof) but fail on poor-sky nights (TOI-270c).
-  For epoch RVs combine the two with floors (telluric 0.032, OH 0.010 km/s; leave-one-target-out
-  floors give sum chi2 0.86 for 4 dof): expected per-pair sd 0.015-0.021 km/s on HD 3167 /
-  GJ 3090 / TOI-969 / LTT 9779 (the observed 0.002-0.017 spreads are partly cancellation: on
-  HD 3167 and LTT 9779 the telluric and OH epoch differences have opposite signs, -0.092 vs
-  +0.043 and +0.050 vs -0.013 km/s).  Within a night tellurics stay the anchor.
-
-Star-mode source (block C2d, 2026-10-22; ``tests/unit/test_wavecal_starmodes.py``)
-------------------------------------------------------------------------------------------
-``AnchorConfig.star_modes_source`` picks the detector modes behind the STARLIGHT labels
-(``kind="star"``); ``kind="tell"`` (telluric features of the object spectrum) always gets the
-telluric fit.  "tell" (default, the original behaviour; bit-identical on the 6 nights below in
-every solution field and label), "oh" (OH instrument modes at the object exposures + a star zero
-point from the tellurics with that pattern removed; the telluric features keep the default's
-zero-point time model, ``AnchorSolution.z_tell``, and ``sol.tell`` keeps the full telluric fit
-for the surface code, the OH-subtracted zero points going to ``sol.tell["z_star_light"]``),
-"tell_sep" (one more (x, m) x regressor,
-``star_chroma`` = airmass (``SpectrumSet.airmass``, filled by both loaders) or time, fitted on the
-tellurics and kept telluric-only).  Held-out validation on STELLAR lines (per-(frame, order)
-velocities on the raw grid against each night's leave-one-out stellar template, BERV + reflex
-removed; every line-table absorber and OH residual masked, so no anchoring pixel enters; mean
-over 4 mask variants: table mask x1 / x2, with / without an empirical airmass-varying mask),
-blue-minus-red trend over the night [m/s] (per-frame slope vs 1/lambda^2) for tell / oh /
-tell_sep(airmass) / no star modes, then out-of-transit per-frame stellar RV rms [m/s]:
-K2-141 -74 / -260 / -40 / +21, 38 / 39 / 30; TOI-836 +95 / +111 / +113 / +66, 11 / 20 / 13;
-WASP-193 +310 / +88 / +315 / +214, 161 / 213 / 156; TOI-3486 -170 / +21 / -58 / +108,
-40 / 46 / 39; WASP-69 -123 / -35 / -56 / +348, 116 / 95 / 117 (TOI-2109, vsini 81 km/s: stellar
-velocities unusable).  Pooled trend chi2 (5 nights, stat + mask-variant spread): 16.1 / 16.3 /
-15.4 (tell_sep time: 54, collinear with the drift; no star modes 11.2 and telluric modes without
-the nod column 11.3, both with worse per-order residuals); RV rms geometric mean vs "tell": oh
-x1.19, tell_sep x0.97 (better on K2-141, worse on TOI-836); the per-order chromatic residual
-chi2 is lowest with "tell" on K2-141, TOI-836 and TOI-3486 (tell_sep +2-4 %, oh +6-27 %, no modes
-+24-53 %; on the noise-dominated WASP-193 oh / no modes are 8-9 % lower).  An independent
-re-measurement (synthetic-transmission telluric mask placed per frame, percentile continuum,
-chi2-scan velocities per half order, 4 mask variants) agrees on the option DIFFERENCES on the
-HIRES nights but moves each night's absolute trend by up to ~250 m/s (same metric, "tell":
-K2-141 -66 vs -56, TOI-836 +104 vs +213, TOI-3486 -153 vs +13, WASP-69 -129 vs +39 m/s), so the
-earlier "tell over-corrects TOI-3486" reading is not robust; pooled over the 5 nights it ranks
-"tell" ahead of oh and tell_sep (trend chi2 10.7 / 37.4 / 24.1, RV rms x1.13 / x1.00).
-A per-night choice by cross-validation over orders (pick on even orders, score on odd and vice
-versa) does not beat "tell" either (test |trend| 87 / 76 / 425 / 164 / 160 vs 91 / 87 / 411 /
-155 / 154).  The absolute held-out trend moves by up to ~150 m/s with the telluric mask
-(contamination by weak unlisted absorbers), so per-night trends below ~100 m/s are not
-resolved.  Hence "tell" stays the default; "oh" / "tell_sep" are opt-in.  WASP-69 (WIDE): the
-telluric NOD column of the star modes adds frame-to-frame noise to starlight (RV rms 116 -> 67,
-point-to-point 117 -> 65 m/s without it), but dropping it hurts every HIRES night (TOI-3486
-40 -> 49, TOI-836 11 -> 15 m/s), so it is not changed here.
+Method details, the line list's provenance and the validation record: ``docs/WAVECAL.md``.
 """
 from __future__ import annotations
 
@@ -255,7 +92,6 @@ __all__ = [
     "AnchorConfig",
     "AnchorSolution",
     "EcSolution",
-    "LineScale",
     "LineTable",
     "NightSpectra",
     "SpectrumSet",
@@ -268,7 +104,6 @@ __all__ = [
     "anchor_reduction",
     "anchored_zero_points",
     "build_absorber_features",
-    "build_line_scale",
     "build_oh_features",
     "build_static_surface",
     "choose_method",
@@ -303,10 +138,10 @@ def _quiet(fn):
 
 
 def _jax64():
-    """The JAX float64 backend of the forward-model shim (sets ``jax_enable_x64``)."""
-    from decanter.wavecal._xp import get_backend
+    """Enable JAX float64 (every fit here runs in double precision)."""
+    import jax
 
-    return get_backend("jax", "float64")
+    jax.config.update("jax_enable_x64", True)
 
 
 # =============================================================================== line table
@@ -364,16 +199,10 @@ class LineTable:
         oh, ab = _parse_line_table(str(p))
         return cls(oh=oh, absorbers=ab, path=p)
 
-    def oh_lines(self, lo: float, hi: float, *, positions: str = "hitran") -> dict:
-        """OH components with ``lo < lam < hi``; ``positions="oliva"`` substitutes the
-        Bernath & Colin 2009 positions where matched."""
+    def oh_lines(self, lo: float, hi: float) -> dict:
+        """OH components with ``lo < lam < hi`` (HITRAN positions)."""
         s = (self.oh["lam"] > lo) & (self.oh["lam"] < hi)
-        out = {k: v[s] for k, v in self.oh.items()}
-        if positions == "oliva":
-            out["lam"] = np.where(np.isfinite(out["lam_oliva"]), out["lam_oliva"], out["lam"])
-        elif positions != "hitran":
-            raise ValueError(f"positions={positions!r}: use 'hitran' or 'oliva'")
-        return out
+        return {k: v[s] for k, v in self.oh.items()}
 
     def absorber_lines(self, lo: float, hi: float, *, species=("H2O",), R: float = 60000.0,
                        p_eff: dict | None = None) -> dict:
@@ -474,24 +303,6 @@ class ThArTemplate(_Dispersion):
     def p_range(self, m: int) -> tuple[float, float]:
         k = self._k(m)
         return float(self.pmin[k]), float(self.pmax[k])
-
-    def lam_xp(self, xp, m: int, p):
-        """``lambda_m(p)`` in an array namespace (numpy / jax.numpy / mlx.core) for gradients
-        w.r.t. ``p``.  Use float64 (JAX x64) for absolute wavelengths."""
-        k = self._k(m)
-        xn = (2.0 * p - (self.pmax[k] + self.pmin[k])) / (self.pmax[k] - self.pmin[k])
-        c = [float(v) for v in self.coef[k]]
-        if int(self.kind[k]) == 1:     # Clenshaw for Chebyshev
-            b1 = b2 = 0.0 * xn
-            for cj in c[:0:-1]:
-                b1, b2 = 2.0 * xn * b1 - b2 + cj, b1
-            return xn * b1 - b2 + c[0]
-        Pm, P = 1.0 + 0.0 * xn, xn     # Legendre recurrence
-        out = c[0] * Pm + (c[1] * P if len(c) > 1 else 0.0)
-        for j in range(2, len(c)):
-            Pm, P = P, ((2 * j - 1) * xn * P - (j - 1) * Pm) / j
-            out = out + c[j] * P
-        return out
 
     @classmethod
     def from_arrays(cls, orders, coef, pmin, pmax, *, kind=1, dy=None, source="arrays"):
@@ -650,8 +461,7 @@ class SpectrumSet:
             pixels: the raw pixel of label pixel ``p`` is ``p - shift_px[f]`` (WARP s10/s11:
             ``waveShiftAdopted / dy``).  None = labels are raw.
         frame_ids: optional per-frame names.
-        airmass: optional (F,) airmass of each exposure (header ``AIRMASS``; only used by
-            ``AnchorConfig.star_modes_source="tell_sep"`` with ``star_chroma="airmass"``).
+        airmass: optional (F,) airmass of each exposure (header ``AIRMASS``).
     """
 
     kind: str
@@ -952,7 +762,6 @@ class AnchorConfig:
     oh_imin: float = 2e-4           # min model I_rel of a feature's main group
     oh_risk: float = 0.01           # max modelled centroid-bias risk, FWHM
     oh_pad: float = 1.6             # feature window pad, FWHM
-    oh_positions: str = "hitran"
     snr_frame: float = 3.0          # per-frame line S/N to use a fit
     snr_comb_oh: float = 60.0       # combined (quadrature over frames) S/N to adopt a line
     snr_comb_tell: float = 30.0
@@ -974,16 +783,6 @@ class AnchorConfig:
     # with m on WIDE and HIRES-J), but over-fits a few-order night (3-order synthetic test).
     sky_modes: tuple | str | None = "auto"    # x (nod, drift) regressors, sky
     star_modes: tuple | str | None = "auto"   # x (X - <X>, nod) regressors, star
-    # Which detector modes put STARLIGHT on the true scale (``kind="star"`` labels; the telluric
-    # features of the object spectrum always get the telluric fit, ``kind="tell"``):
-    #   "tell"     the telluric-fitted modes x (X - <X>, nod) (the original behaviour);
-    #   "oh"       the OH-fitted instrument modes x (nod, drift) at the object exposures, with the
-    #              per-frame star zero point from the tellurics after removing that pattern;
-    #   "tell_sep" the telluric fit with one more regressor, ``star_chroma`` (airmass or time,
-    #              centred), whose (x, m) term is treated as telluric-only (not applied to
-    #              starlight).
-    star_modes_source: str = "tell"
-    star_chroma: str = "airmass"      # "airmass" (SpectrumSet.airmass; time if missing) | "time"
     # Conditioning guard of the detector modes (:func:`_guard_modes`): a (qx, qm) basis is used
     # only with >= modes_min_lines_per_term x qx qm lines and a maximum prediction leverage
     # (unweighted, over every (x, m) of the night's orders) <= modes_max_leverage; otherwise
@@ -1018,27 +817,18 @@ class AnchorConfig:
     surface_tau_default: float = 0.02   # km/s night-to-night line-offset scatter (1-night surface)
     use_star_shape: bool = True     # apply a surface's telluric (star) shape to star labels
     use_surface_modes: bool = True  # apply a surface's nod (x, m) pattern (A/B slit position)
-    # ... and its drift pattern (x, m) x (zero point - X0).  Off: the drift-dependent shape is
-    # night-specific (it did not transfer between the halves of TOI-2109, and averages to ~0
-    # over the 11 LCO24b setting-6 nights), so only the A/B pattern is static
-    use_surface_drift: bool = False
     # ---- A-only frames (no sky spectrum: decanter.reduce(sky=None), no nod partner): the OH
     # airglow is still in the object spectrum and is measured there (:func:`anchor_frames`)
-    # contaminants (OH emission in the telluric fits, telluric absorption in the OH fits):
-    # "exclude" drops a feature whose fit window (+- margin) holds one, "mask" zero-weights the
-    # contaminated pixels (+- halfwidth), "none".  21 A-only TOI-2109 frames (decanter.reduce
-    # sky=None): OH zero point minus the series OH model at the exposure -0.001 (exclude) /
-    # +0.006 (none) / -0.005 (mask) km/s mean, 0.026 / 0.025 / 0.027 rms; telluric zero point
-    # minus the A-B frame's +0.020 / +0.017 / +0.043 (masking leaves asymmetric fit windows)
-    aonly_contaminants: str = "exclude"
+    # contaminants (OH emission in the telluric fits, telluric absorption in the OH fits) are
+    # dropped: a feature whose fit window (+- margin) holds one is not used
     aonly_oh_imin: float = 2e-3         # OH lines that contaminate (model I_rel) ...
-    aonly_oh_halfwidth: float = 0.5     # ... margin (exclude) / half width (mask), FWHM
+    aonly_oh_halfwidth: float = 0.5     # ... margin, FWHM
     aonly_tell_depth: float = 0.1       # telluric lines that contaminate (model depth) ...
-    aonly_tell_halfwidth: float = 0.5   # ... margin / half width (x (1 + min(depth/0.2, 2))), FWHM
+    aonly_tell_halfwidth: float = 0.5   # ... margin (x (1 + min(depth/0.2, 2))), FWHM
     # "sparse" epochs: free per-frame zero points ("frame"), or per epoch group one zero point +
-    # an A/B nod term ("nod"; an ABBA epoch: 2 parameters from 4 frames) + a linear drift
-    # ("nod_drift"; ABBA makes the nod and drift terms orthogonal), for the sky (OH) and the
-    # star (telluric) zero points; z / z_err are then the model values at every frame
+    # an A/B nod term + a linear drift ("nod_drift"; ABBA makes the nod and drift terms
+    # orthogonal), for the sky (OH) and the star (telluric) zero points; z / z_err are then the
+    # model values at every frame
     epoch_model: str = "frame"
 
     @classmethod
@@ -1080,8 +870,7 @@ class AnchorConfig:
 
 # =========================================================================== features
 def build_oh_features(lines: LineTable, lo: float, hi: float, R: float, *, imin: float = 2e-4,
-                      risk_max: float = 0.01, pad: float = 1.6, doublet_max: float = 4.0,
-                      positions: str = "hitran") -> list[dict]:
+                      risk_max: float = 0.01, pad: float = 1.6, doublet_max: float = 4.0) -> list[dict]:
     """Lambda-doublet-aware OH feature templates for the wavelength range ``(lo, hi)``.
 
     A feature = the brightest unused component + its Lambda-doublet partner (if within
@@ -1095,7 +884,7 @@ def build_oh_features(lines: LineTable, lo: float, hi: float, R: float, *, imin:
     """
     fw = C_KMS / R
     margin = 3.0 * fw / C_KMS * hi
-    L = lines.oh_lines(lo - margin, hi + margin, positions=positions)
+    L = lines.oh_lines(lo - margin, hi + margin)
     lam, inten, grp = L["lam"], L["I"], L["group"]
     if lam.size == 0:
         return []
@@ -1943,7 +1732,7 @@ def _xcorr_init(sset: SpectrumSet, template, lines: LineTable, cfg: AnchorConfig
     for m, A in HPs.items():
         g = grids[m]
         ref_obs = np.median(_shift_rows(A, drift / dv)[good], axis=0)
-        ol = lines.oh_lines(g[0], g[-1], positions=cfg.oh_positions)
+        ol = lines.oh_lines(g[0], g[-1])
         model = np.zeros(g.size)
         for lc, Ii in zip(ol["lam"], ol["I"], strict=True):
             c = int(np.searchsorted(g, lc))
@@ -2163,16 +1952,6 @@ class AnchorSolution:
     star_modes: dict | None = None
     star_shape: dict | None = None      # static telluric surface (single / sparse path only)
     method: str = "series"              # "series" (anchor_night), "single" or "sparse"
-    # modes applied to STARLIGHT labels when they differ from the telluric fit
-    # (``AnchorConfig.star_modes_source`` "oh" / "tell_sep"); None = ``star_modes``
-    star_light_modes: dict | None = None
-    # zero point of the TELLURIC features (``kind="tell"``) when it differs from the starlight
-    # one (``star_modes_source="oh"``: time model of the full telluric fit); None = ``z_star``
-    z_tell: np.ndarray | None = None
-    z_tell_err: np.ndarray | None = None
-
-    def _z_tell(self):
-        return self.z_star if self.z_tell is None else self.z_tell
 
     @staticmethod
     def _u(z):
@@ -2180,10 +1959,9 @@ class AnchorSolution:
 
     def u(self, kind: str = "star") -> np.ndarray:
         """Per-frame label offsets ``u_f = -log1p(z_f / c)`` (float32): ``"star"`` (object
-        frames, telluric-anchored; ``"tell"``: the telluric features, ``z_tell`` if set, else the
-        same zero point), ``"inst"`` (OH zero point at the object exposures), ``"sky"`` (the sky
+        frames, telluric-anchored; ``"tell"``: the same zero point), ``"inst"`` (OH zero point at the object exposures), ``"sky"`` (the sky
         spectra).  Excludes s10 undo and the sky shape (see :meth:`labels`)."""
-        z = {"star": self.z_star, "tell": self._z_tell(), "inst": self.z_inst,
+        z = {"star": self.z_star, "tell": self.z_star, "inst": self.z_inst,
              "sky": self.z_sky}[kind]
         if z is None:
             raise ValueError(f"no {kind!r} solution (no object spectra?)")
@@ -2205,15 +1983,11 @@ class AnchorSolution:
     @_quiet
     def modes_kms(self, m: int, lam, kind: str = "star", frames=None) -> np.ndarray:
         """(F, n) detector-mode velocity ``sum_jp Phi_j(x, m) C_jp R_fp`` [km/s] (0 if none):
-        ``kind="star"`` (starlight in the object frames: ``star_light_modes`` if set, else the
-        telluric modes), ``"tell"`` (telluric features of the object frames: the full
-        telluric fit), ``"inst"`` / ``"sky"`` (OH modes at the object / sky exposures)."""
+        ``kind="star"`` / ``"tell"`` (the telluric modes at the object frames), ``"inst"`` /
+        ``"sky"`` (OH modes at the object / sky exposures)."""
         lam = np.asarray(lam, np.float64)
-        if kind == "star":
-            md = self.star_modes if self.star_light_modes is None else self.star_light_modes
-        else:
-            md = self.star_modes if kind == "tell" else self.oh_modes
-        z = {"star": self.z_star, "tell": self._z_tell(), "inst": self.z_inst,
+        md = self.star_modes if kind in ("star", "tell") else self.oh_modes
+        z = {"star": self.z_star, "tell": self.z_star, "inst": self.z_inst,
              "sky": self.z_sky}[kind]
         fr = np.arange(len(z)) if frames is None else np.asarray(frames)
         if md is None:
@@ -2233,7 +2007,7 @@ class AnchorSolution:
             z = self.z_sky
             shift = None
         else:
-            z = self.z_star if kind == "star" else self._z_tell() if kind == "tell" else self.z_inst
+            z = self.z_star if kind in ("star", "tell") else self.z_inst
             shift = self.obj_shift_px
         if z is None:
             raise ValueError(f"no {kind!r} solution")
@@ -2295,8 +2069,7 @@ def anchor_night(night: NightSpectra, config: AnchorConfig | None = None, *,
     for m in sky.orders:
         lam = np.asarray(sky.lam[m])
         fs = build_oh_features(lines, float(np.nanmin(lam)), float(np.nanmax(lam)), cfg.R,
-                               imin=cfg.oh_imin, risk_max=cfg.oh_risk, pad=cfg.oh_pad,
-                               positions=cfg.oh_positions)
+                               imin=cfg.oh_imin, risk_max=cfg.oh_risk, pad=cfg.oh_pad)
         lo_ok = np.nanmin(lam) * (1 + (cfg.xcorr_vmax + fw * (cfg.oh_pad + 1)) / C_KMS)
         hi_ok = np.nanmax(lam) * (1 - (cfg.xcorr_vmax + fw * (cfg.oh_pad + 1)) / C_KMS)
         feats[m] = [f for f in fs if f["clean"] and lo_ok < f["lref"] < hi_ok]
@@ -2416,8 +2189,6 @@ def anchor_night(night: NightSpectra, config: AnchorConfig | None = None, *,
     tell_out = None
     stm = None
     star_modes = None
-    star_light_modes = None
-    z_tell = z_tell_err = None
     if obj is not None:
         nod_o = _nod_code(obj.nod)
         Ho = np.column_stack([np.ones(obj.n_frames), nod_o]) if has_nod else np.ones((obj.n_frames, 1))
@@ -2464,23 +2235,13 @@ def anchor_night(night: NightSpectra, config: AnchorConfig | None = None, *,
                 star_q = None if star_spec is None else (star_spec["qx"], star_spec["qm"])
                 warnings.warn(f"{night.name}: star detector modes reduced to {star_q} by the "
                               f"conditioning guard ({te['n_kept']} telluric lines)", stacklevel=2)
-        src = str(cfg.star_modes_source)
-        if src not in ("tell", "oh", "tell_sep"):
-            raise ValueError(f"star_modes_source={src!r}: use 'tell', 'oh' or 'tell_sep'")
-        light = None
-        if te is not None and src != "tell" and np.sum(np.isfinite(te["tw"]["z"])) >= 3:
-            light = _star_light_decomposition(src, te, tmpl, cfg, obj, oh_modes, star_spec,
-                                              R_star, night.name)
-            diag["star_modes_source"] = src if light is not None else "tell"
-            if light is not None:
-                diag.update(light["diag"])
         if te is None or np.sum(np.isfinite(te["tw"]["z"])) < 3:
             warnings.warn(f"{night.name}: too few telluric lines; star term = OH zero point",
                           stacklevel=2)
             z_star, z_star_err = z_inst.copy(), z_inst_err.copy()
             diag["star_source"] = "oh"
         else:
-            twt = te["tw"] if light is None else light["tw"]
+            twt = te["tw"]
             zt, et = twt["z"], twt["z_err"]
             t4 = time.perf_counter()
             cols = [np.ones(obj.n_frames), X] + ([nod_o] if has_nod_o else [])
@@ -2496,18 +2257,6 @@ def anchor_night(night: NightSpectra, config: AnchorConfig | None = None, *,
             z_star, z_star_err = stm.predict(obj.time, Hst, obj.epoch)
             bs, bsc = stm.fixed_effects()
             tell_src = twt
-            if light is not None and light["src"] == "oh":
-                # the telluric features keep the FULL telluric fit (kind="tell", sol.tell and
-                # the surface code): same time model on the default telluric zero points
-                tell_src = te["tw"]
-                zt0, et0 = tell_src["z"], tell_src["z_err"]
-                bm0 = np.r_[np.nanmedian(zt0 - b0m * X), b0m, np.zeros(len(nm) - 2)]
-                stm0 = fit_time_model(obj.time, zt0, et0 ** 2 + (b0m * X_sd) ** 2, Hst,
-                                      epochs=obj.epoch, names=nm, b_mean=bm0, b_cov=bc,
-                                      length_bounds=cfg.gp_length_bounds,
-                                      robust_iter=cfg.gp_robust_iter, t_ref=ohm.t_ref,
-                                      amp_scale=cfg.star_gp_amp_scale)
-                z_tell, z_tell_err = stm0.predict(obj.time, Hst, obj.epoch)
             timing["star_gp"] = time.perf_counter() - t4
             # OLS diagnostic (verify-style): raw telluric zp on OH smooth (nod-free) + nod
             sm_x, _ = ohm.predict(obj.time, H0, obj.epoch, jitter=False)
@@ -2533,20 +2282,15 @@ def anchor_night(night: NightSpectra, config: AnchorConfig | None = None, *,
                         star_zp_median=float(np.nanmedian(zt)),
                         star_minus_inst_median=float(np.nanmedian(zt - z_inst)),
                         star_z_err_median=float(np.median(z_star_err)))
-            twm = te["tw"] if light is None or light["src"] == "oh" else twt   # telluric fit
+            twm = twt
             if star_spec is not None and twm["C"].size:
-                Rm = R_star if light is None or light["src"] == "oh" else light["R_tell"]
+                Rm = R_star
                 star_modes = dict(star_spec, C=twm["C"], C_cov=twm["C_cov"],
                                   phi_mean=twm["phi_mean"], reg_mean=twm["reg_mean"],
-                                  R_obj=Rm, names=("X",) + (("nod",) if has_nod_o else ()) + (
-                                      ("chroma",) if Rm.shape[1] > R_star.shape[1] else ()))
+                                  R_obj=Rm, names=("X",) + (("nod",) if has_nod_o else ()))
                 diag["star_modes_C"] = twm["C"].tolist()
                 diag["star_modes_q"] = star_q
                 diag["star_modes_ptp_kms"] = _modes_ptp(tmpl, obj.lam, star_modes, Rm)
-            if light is not None:
-                star_light_modes = light["modes"]
-                diag["star_light_modes_ptp_kms"] = _modes_ptp(
-                    tmpl, obj.lam, star_light_modes, star_light_modes["R_obj"])
             tell_out = dict(z=tell_src["z"], z_err=tell_src["z_err"], n_lines=tell_src["n_lines"],
                             mu=tell_src["mu"], mu_err=tell_src["mu_err"], sigma=te["sigma"],
                             line_scatter=tell_src["line_scatter"], s_sys=tell_src["s_sys"],
@@ -2554,8 +2298,6 @@ def anchor_night(night: NightSpectra, config: AnchorConfig | None = None, *,
                             lref=np.array([f["lref"] for f in te["meta"]]),
                             species=np.array([f["species"] for f in te["meta"]]),
                             d=te["d"], e=te["e"], valid=te["valid"], X=X, X_sd=X_sd)
-            if tell_src is not twt:
-                tell_out["z_star_light"], tell_out["z_star_light_err"] = zt, et
     timing["total"] = time.perf_counter() - t_start
     diag["timing_s"] = timing
     if verbose:
@@ -2566,84 +2308,9 @@ def anchor_night(night: NightSpectra, config: AnchorConfig | None = None, *,
         obj_shift_px=None if obj is None else obj.shift_px, z_star=z_star, z_star_err=z_star_err,
         z_inst=z_inst, z_inst_err=z_inst_err, sky_time=sky.time, sky_nod=sky.nod, z_sky=z_sky,
         z_sky_err=z_sky_err, oh=oh_out, tell=tell_out, shape=shape, oh_model=ohm,
-        star_model=stm, diagnostics=diag, oh_modes=oh_modes, star_modes=star_modes,
-        star_light_modes=star_light_modes, z_tell=z_tell, z_tell_err=z_tell_err)
+        star_model=stm, diagnostics=diag, oh_modes=oh_modes, star_modes=star_modes)
 
 
-def _sub_modes(md: dict, keep) -> dict:
-    """Copy of a detector-mode dict restricted to the regressor columns ``keep``."""
-    keep = list(keep)
-    C = np.asarray(md["C"], np.float64)
-    J, P = C.shape
-    idx = [j * P + p for j in range(J) for p in keep]
-    cov = np.asarray(md["C_cov"], np.float64)
-    out = dict(md, C=C[:, keep], reg_mean=np.asarray(md["reg_mean"])[keep],
-               R_obj=np.asarray(md["R_obj"])[:, keep],
-               names=tuple(np.asarray(md["names"], object)[keep].tolist()))
-    out["C_cov"] = cov[np.ix_(idx, idx)] if cov.shape == (J * P, J * P) else cov
-    return out
-
-
-def _star_light_decomposition(src, te, tmpl, cfg, obj, oh_modes, star_spec, R_star, name):
-    """Telluric decomposition behind the STARLIGHT labels for ``star_modes_source`` "oh" /
-    "tell_sep" (:class:`AnchorConfig`).  Same lines as the telluric fit ``te``.  Returns
-    ``dict(src, tw, modes, R_tell, diag)`` or None (falls back to "tell", with a warning)."""
-    order = np.array([f["order"] for f in te["meta"]], int)
-    lref = np.array([f["lref"] for f in te["meta"]], np.float64)
-    if src == "oh":
-        if oh_modes is None or oh_modes.get("R_obj") is None:
-            warnings.warn(f"{name}: star_modes_source='oh' without OH modes; using 'tell'",
-                          stacklevel=3)
-            return None
-        Phi = _mode_basis(tmpl, order, lref, oh_modes) - oh_modes["phi_mean"]
-        Rc = np.asarray(oh_modes["R_obj"]) - oh_modes["reg_mean"]
-        pat = Phi @ np.asarray(oh_modes["C"]) @ Rc.T                 # (K, F) km/s
-        tw = robust_zero_points(te["d"] - pat, te["e"], huber=cfg.huber, valid=te["valid"])
-        md = {k: oh_modes[k] for k in ("qx", "qm", "xr", "mr", "C", "C_cov", "phi_mean",
-                                       "reg_mean", "R_obj", "names")}
-        md["source"] = "oh"
-        return dict(src=src, tw=tw, modes=md, R_tell=R_star,
-                    diag=dict(star_light_scatter_median=float(np.nanmedian(tw["line_scatter"])),
-                              star_light_s_sys=tw["s_sys"]))
-    # "tell_sep"
-    if star_spec is None or R_star is None:
-        warnings.warn(f"{name}: star_modes_source='tell_sep' without star modes; using 'tell'",
-                      stacklevel=3)
-        return None
-    kind = str(cfg.star_chroma)
-    if kind not in ("airmass", "time"):
-        raise ValueError(f"star_chroma={kind!r}: use 'airmass' or 'time'")
-    am = None if obj.airmass is None else np.asarray(obj.airmass, np.float64)
-    if kind == "airmass" and (am is None or not np.all(np.isfinite(am))):
-        warnings.warn(f"{name}: no airmass for every object frame; star_chroma='time'",
-                      stacklevel=3)
-        kind = "time"
-    a = am if kind == "airmass" else (obj.time - np.mean(obj.time)) * 24.0
-    a = a - np.mean(a)
-    R3 = np.column_stack([R_star, a])
-    Phi = _mode_basis(tmpl, order, lref, star_spec)
-    tw = robust_zero_points(te["d"], te["e"], huber=cfg.huber, valid=te["valid"], modes=Phi,
-                            regressors=R3)
-    P = R3.shape[1]
-    full = dict(star_spec, C=tw["C"], C_cov=tw["C_cov"], phi_mean=tw["phi_mean"],
-                reg_mean=tw["reg_mean"], R_obj=R3, names=tuple(f"r{p}" for p in range(P)))
-    md = _sub_modes(full, range(P - 1))
-    md["names"] = ("X", "nod")[:P - 1]
-    md["source"] = "tell_sep"
-    chroma = _sub_modes(full, [P - 1])
-    cA = np.asarray(chroma["C"], np.float64).ravel()
-    covA = np.asarray(chroma["C_cov"], np.float64)
-    try:
-        wald = float(cA @ np.linalg.solve(covA, cA))
-    except np.linalg.LinAlgError:
-        wald = float("nan")
-    return dict(src=src, tw=tw, modes=md, R_tell=R3,
-                diag=dict(star_chroma=kind, star_chroma_C=cA.tolist(), star_chroma_wald=wald,
-                          star_chroma_dof=int(cA.size),
-                          star_chroma_ptp_kms=_modes_ptp(tmpl, obj.lam, chroma, R3[:, [P - 1]])))
-
-
-# ================================================== single image / sparse epochs (block C2b)
 SURFACE_FILENAME = "decanter_wavelength_surface.json"
 SURFACE_VERSION = 2               # 2: part["scale"] (the convention of the line offsets)
 
@@ -3219,7 +2886,7 @@ def _build_part(sols, kind, template, q, huber, tau_default, min_lines=20, max_r
 def build_static_surface(solutions, *, calib: str = "", sky_shape: tuple = (2, 2),
                          star_shape: tuple = (2, 2), huber: float = 2.0,
                          tau_default: float = 0.02, min_lines: int = 20,
-                         max_rms_fwhm: tuple = (0.12, 0.25), scale=None) -> StaticSurface:
+                         max_rms_fwhm: tuple = (0.12, 0.25)) -> StaticSurface:
     """Build the static per-calibration-set surface from one or more night solutions.
 
     No WARP equivalent (WARP has no absolute wavelength scale beyond the period ThAr fit).
@@ -3246,19 +2913,11 @@ def build_static_surface(solutions, *, calib: str = "", sky_shape: tuple = (2, 2
     rms 0.86 km/s = 0.17 FWHM vs 0.025-0.075 on normal nights; pi Men, 30 s: 7 lines).  The
     telluric offsets are intrinsically larger (blends; 0.05-0.09 FWHM in HIRES, 0.14 in WIDE).
 
-    ``scale``: a :class:`LineScale` (for its ``kind``) or ``{"star": ..., "sky": ...}`` puts that
-    part on ONE absolute scale shared by every calibration set (:func:`_rescale_part`); without
-    it a part keeps this set's own gauge.  Either way ``part["scale"]`` records the convention.
+    Per-line offsets stay on this calibration set's own gauge (``part["scale"]``).
     """
     sols = [solutions] if isinstance(solutions, AnchorSolution) else list(solutions)
     if not sols:
         raise ValueError("build_static_surface: no solutions")
-    if isinstance(scale, LineScale):
-        scale = {scale.kind: scale}
-    scale = dict(scale or {})
-    for k, v in scale.items():
-        if k not in ("sky", "star") or v.kind != k:
-            raise ValueError(f"scale[{k!r}]: a LineScale of kind {k!r}")
     tmpl = sols[0].template
     tid = _template_id(tmpl)
     for s in sols[1:]:
@@ -3275,15 +2934,10 @@ def build_static_surface(solutions, *, calib: str = "", sky_shape: tuple = (2, 2
     for k, part in parts.items():
         if part is None:
             continue
-        if k in scale:
-            if str(scale[k].mode).upper() != str(sols[0].mode).upper():
-                raise ValueError(f"scale mode {scale[k].mode} vs {sols[0].mode}")
-            parts[k] = _rescale_part(part, scale[k], tmpl, sols)
-        else:
-            part["scale"] = dict(kind="set", gauge=part["gauge"], note=(
-                "per-line offsets on THIS calibration set's own gauge (information-weighted "
-                "mean of its build nights' lines); its zero point is not comparable with "
-                "another set's: build with scale=LineScale for one absolute scale"))
+        part["scale"] = dict(kind="set", gauge=part["gauge"], note=(
+            "per-line offsets on THIS calibration set's own gauge (information-weighted "
+            "mean of its build nights' lines); its zero point is not comparable with "
+            "another set's"))
     sky, star = parts["sky"], parts["star"]
     import datetime
 
@@ -3295,370 +2949,6 @@ def build_static_surface(solutions, *, calib: str = "", sky_shape: tuple = (2, 2
         meta=dict(created=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
                   n_frames=[int(np.size(s.z_sky)) for s in sols],
                   methods=[s.method for s in sols]))
-
-
-# ------------------------------------------------------------ one absolute scale (C2c)
-LINE_SCALE_VERSION = 1
-LINE_SCALE_FILENAME = "decanter_line_scale_{kind}_{mode}.json"
-_SCALE_NOTES = {
-    "star": ("telluric H2O line list: HITRAN2020 positions + delta_air x P_eff (0.60 atm); level ="
-             " information-weighted mean of the table's per-line offsets = 0"),
-    "sky": ("OH line list: HITRAN2020 positions (Oliva+2015 / Bernath & Colin 2009 positions: "
-            "HITRAN - Oliva = -0.021 km/s median, 0.044 km/s robust sd per line); level = "
-            "information-weighted mean of the table's per-line offsets = 0"),
-}
-
-
-def _scale_basis(x, m, xr, mr, q) -> np.ndarray:
-    xn = (2 * np.asarray(x, np.float64) - (xr[0] + xr[1])) / (xr[1] - xr[0])
-    mn = (2 * np.asarray(m, np.float64) - (mr[0] + mr[1])) / max(mr[1] - mr[0], 1e-9)
-    return _cheb2(xn, mn, int(q[0]), int(q[1]))[:, 1:]
-
-
-@dataclass
-class LineScale:
-    """ONE absolute scale for the static per-line offsets of every calibration set (no WARP
-    equivalent).
-
-    A :class:`StaticSurface` built without a scale stores its per-line offsets on its OWN gauge
-    (the information-weighted mean over the lines of its build nights): the static template
-    term of that calibration set is then mixed with the projection of the line-list errors on
-    its smooth surface, and two sets do not share a zero point (TOI-969 on two LCO25a sets:
-    0.042 km/s between the epochs with such files vs 0.010 without).  The scale separates the
-    two terms over the nights of ALL sets of a mode:
-
-        mu_kn = err_k + T_s(n)(x, m) + c_n
-
-    ``err_k`` (the line's offset from the line list, the same line in every set), ``T_s`` a
-    smooth ``(x, m)`` term per calibration set (Chebyshev, no constant: the set's ThAr-template
-    shape), ``c_n`` a gauge constant per night; robust alternating least squares with a ridge
-    prior ``err ~ N(0, ridge_sd^2)`` and night-to-night excess scatter ``tau``.  Gauge: the
-    information-weighted mean of ``err`` is 0 (:data:`_SCALE_NOTES`).  A surface built with the
-    scale (:func:`build_static_surface` ``scale=``) stores ``err_k + T_s(x_k)`` and ``T_s``, so
-    every file is on this one scale (``part["scale"]`` records which).
-
-    ``offset_vs_oh`` (star): median over the nights of the telluric zero point on this scale
-    minus the OH instrument zero point (slit + line-list scale; the OH scale itself carries
-    the HITRAN - Oliva systematic).
-    """
-
-    kind: str
-    mode: str
-    q: tuple
-    lref: np.ndarray
-    order: np.ndarray
-    err: np.ndarray
-    err_sd: np.ndarray
-    n_nights: np.ndarray
-    n_sets: np.ndarray
-    tau: float
-    s_err: float
-    sets: dict
-    night_offsets: dict
-    gauge: str
-    offset_vs_oh: dict | None = None
-    meta: dict = field(default_factory=dict)
-    version: int = LINE_SCALE_VERSION
-
-    @property
-    def id(self) -> str:
-        import hashlib
-
-        h = hashlib.sha1(repr((self.kind, self.mode, sorted(self.night_offsets),
-                               self.meta.get("created", ""))).encode())
-        return h.hexdigest()[:12]
-
-    def lookup(self, lref, order=None, *, tol: float = 2e-3):
-        """``(err, err_sd, hit)`` of lines ``lref`` (|d lambda| < ``tol`` A), in the same echelle
-        ``order`` when given.  The offsets are per (order, line): a line in the overlap of two
-        orders has two entries (47 of the 252 HIRES-Y lines), which differ by 0.1-0.3 km/s at the
-        order ends (e.g. 9616.68 A: +0.09 in order 183, -0.17 in 184), so a lookup by
-        wavelength alone hands one order's offset to the other; pass ``order`` for line tables."""
-        lref = np.asarray(lref, np.float64)
-        err = np.zeros(lref.size)
-        sd = np.full(lref.size, np.nan)
-        hit = np.zeros(lref.size, bool)
-        if order is None:
-            groups = [(np.arange(lref.size), np.arange(self.lref.size))]
-        else:
-            order = np.broadcast_to(np.asarray(order, int), lref.shape)
-            groups = [(np.where(order == m)[0], np.where(self.order == m)[0])
-                      for m in np.unique(order)]
-        for s, t in groups:
-            if s.size == 0 or t.size == 0:
-                continue
-            o = t[np.argsort(self.lref[t], kind="stable")]
-            ls = self.lref[o]
-            j = np.clip(np.searchsorted(ls, lref[s]), 1, max(ls.size - 1, 1)) if ls.size > 1 \
-                else np.zeros(s.size, int)
-            jl = np.clip(j - 1, 0, ls.size - 1)
-            jr = np.clip(j, 0, ls.size - 1)
-            pick = np.where(np.abs(ls[jl] - lref[s]) <= np.abs(ls[jr] - lref[s]), jl, jr)
-            h = np.abs(ls[pick] - lref[s]) < tol
-            k = o[pick]
-            hit[s] = h
-            err[s] = np.where(h, self.err[k], 0.0)
-            sd[s] = np.where(h, self.err_sd[k], np.nan)
-        return err, sd, hit
-
-    def set_term(self, template_id: str):
-        """``T_s`` of a calibration set: dict(coef (J,), xr, mr, q, nights) or None."""
-        s = self.sets.get(template_id)
-        return None if s is None else dict(s, q=tuple(self.q))
-
-    @staticmethod
-    def default_path(where, kind: str, mode: str) -> Path:
-        p = Path(where).expanduser()
-        if p.is_dir():
-            return p / LINE_SCALE_FILENAME.format(kind=kind, mode=str(mode).upper())
-        return p
-
-    def save(self, where) -> Path:
-        import json
-
-        path = self.default_path(where, self.kind, self.mode)
-        d = {k: getattr(self, k) for k in ("version", "kind", "mode", "q", "lref", "order", "err",
-                                           "err_sd", "n_nights", "n_sets", "tau", "s_err",
-                                           "sets", "night_offsets", "gauge", "offset_vs_oh",
-                                           "meta")}
-        d["id"] = self.id
-        path.write_text(json.dumps(_json_ready(d), indent=1, allow_nan=False))
-        return path
-
-    @classmethod
-    def load(cls, path) -> LineScale:
-        import json
-
-        d = json.loads(Path(path).expanduser().read_text())
-        if int(d.get("version", 0)) > LINE_SCALE_VERSION:
-            raise ValueError(f"{path}: line scale version {d['version']} > {LINE_SCALE_VERSION}")
-        f = lambda k: np.array([np.nan if v is None else v for v in d[k]], np.float64)  # noqa: E731
-        return cls(kind=d["kind"], mode=d["mode"], q=tuple(d["q"]), lref=f("lref"),
-                   order=np.asarray(d["order"], int), err=f("err"), err_sd=f("err_sd"),
-                   n_nights=np.asarray(d["n_nights"], int), n_sets=np.asarray(d["n_sets"], int),
-                   tau=float(d["tau"]), s_err=float(d["s_err"]),
-                   sets={k: dict(v, coef=np.asarray(v["coef"], np.float64), xr=tuple(v["xr"]),
-                                 mr=tuple(v["mr"])) for k, v in d["sets"].items()},
-                   night_offsets={k: float(v) for k, v in d["night_offsets"].items()},
-                   gauge=d["gauge"], offset_vs_oh=d.get("offset_vs_oh"), meta=d.get("meta", {}),
-                   version=int(d.get("version", LINE_SCALE_VERSION)))
-
-    def summary(self) -> dict:
-        return dict(kind=self.kind, mode=self.mode, id=self.id, n_lines=int(self.err.size),
-                    n_nights=len(self.night_offsets), n_sets=len(self.sets), tau=self.tau,
-                    s_err=self.s_err, offset_vs_oh=self.offset_vs_oh)
-
-
-@_quiet
-def build_line_scale(solutions, *, kind: str = "star", q: tuple = (2, 2), ridge_sd: float = 0.3,
-                     huber: float = 2.0, n_iter: int = 40, min_lines: int = 60,
-                     tau0: float = 0.15) -> LineScale:
-    """Fit a :class:`LineScale` to night solutions of ANY calibration sets of one mode
-    (:func:`anchor_night`; nights with fewer than ``min_lines`` lines are skipped).  No WARP
-    equivalent.  Weights ``1 / (mu_err^2 + tau^2)`` with Huber down-weighting; ``tau`` is
-    refitted from the residuals; a line seen in one set only has its ``err`` shrunk by the ridge
-    prior (so a set's smooth term is not absorbed by unconstrained line offsets)."""
-    sols = [solutions] if isinstance(solutions, AnchorSolution) else list(solutions)
-    modes = {str(s.mode).upper() for s in sols}
-    if len(modes) != 1:
-        raise ValueError(f"build_line_scale: one mode at a time, got {modes}")
-    data = []
-    for s in sols:
-        t = _night_line_table(s, kind)
-        if t is None or t["mu"].size < min_lines:
-            continue
-        tmpl = s.template
-        xr = tuple(float(v) for v in tmpl.p_range(int(tmpl.orders[0])))
-        mr = (float(min(tmpl.orders)), float(max(tmpl.orders)))
-        me = np.asarray(t["mu_err"], np.float64)
-        me = np.where(np.isfinite(me), me, np.nanmedian(me) if np.isfinite(me).any() else 0.05)
-        ok = np.isfinite(t["mu"]) & np.isfinite(t["x"])
-        data.append(dict(name=s.name or f"night{len(data)}", sol=s, tid=_template_id(tmpl),
-                         order=t["order"][ok], lref=t["lref"][ok], mu=t["mu"][ok], me=me[ok],
-                         B=_scale_basis(t["x"][ok], t["order"][ok], xr, mr, q), xr=xr, mr=mr))
-    if not data:
-        raise ValueError("build_line_scale: no night with enough lines")
-    keys = sorted({(int(o), round(float(lr), 4)) for d in data
-                   for o, lr in zip(d["order"], d["lref"], strict=True)})
-    kidx = {k: i for i, k in enumerate(keys)}
-    K = len(keys)
-    J = int(q[0]) * int(q[1]) - 1
-    tids = sorted({d["tid"] for d in data})
-    T = {t: np.zeros(J) for t in tids}
-    for d in data:
-        d["k"] = np.array([kidx[(int(o), round(float(lr), 4))]
-                           for o, lr in zip(d["order"], d["lref"], strict=True)], int)
-        d["hw"] = np.ones(d["mu"].size)
-    c = np.array([float(np.average(d["mu"], weights=1.0 / (d["me"] ** 2 + tau0 ** 2)))
-                  for d in data])
-    tau2 = tau0 ** 2
-    err = np.zeros(K)
-    den = np.zeros(K)
-    for _it in range(int(n_iter)):
-        num = np.zeros(K)
-        den = np.zeros(K)
-        for j, d in enumerate(data):
-            w = d["hw"] / (d["me"] ** 2 + tau2)
-            np.add.at(num, d["k"], w * (d["mu"] - c[j] - d["B"] @ T[d["tid"]]))
-            np.add.at(den, d["k"], w)
-        err = num / (den + 1.0 / ridge_sd ** 2)
-        for t in tids:
-            A = np.concatenate([d["B"] for d in data if d["tid"] == t])
-            ww = np.concatenate([d["hw"] / (d["me"] ** 2 + tau2) for d in data if d["tid"] == t])
-            b = np.concatenate([d["mu"] - c[j] - err[d["k"]] for j, d in enumerate(data)
-                                if d["tid"] == t])
-            # per-night constants are free: project them out of the set's smooth term
-            nid = np.concatenate([np.full(d["mu"].size, j) for j, d in enumerate(data)
-                                  if d["tid"] == t])
-            Ac = A.copy()
-            for j in np.unique(nid):
-                s_ = nid == j
-                Ac[s_] -= np.average(A[s_], axis=0, weights=ww[s_])
-            T[t] = np.linalg.lstsq(Ac * np.sqrt(ww)[:, None], b * np.sqrt(ww), rcond=None)[0]
-        for j, d in enumerate(data):
-            w = d["hw"] / (d["me"] ** 2 + tau2)
-            c[j] = float(np.sum(w * (d["mu"] - err[d["k"]] - d["B"] @ T[d["tid"]])) / np.sum(w))
-        g = float(np.sum(den * err) / max(np.sum(den), 1e-300))      # gauge: <err>_info = 0
-        err = err - g
-        c = c + g
-        rr, ee = [], []
-        for j, d in enumerate(data):
-            r = d["mu"] - c[j] - err[d["k"]] - d["B"] @ T[d["tid"]]
-            tt = r / np.sqrt(d["me"] ** 2 + tau2)
-            sc = 1.4826 * float(np.median(np.abs(tt))) + 1e-12
-            d["hw"] = np.where(np.abs(tt) <= huber * sc, 1.0, huber * sc / np.abs(tt))
-            rr.append(r)
-            ee.append(d["me"])
-        rr = np.concatenate(rr)
-        ee = np.concatenate(ee)
-        tau2 = max((1.4826 * float(np.median(np.abs(rr)))) ** 2 - float(np.median(ee ** 2)), 1e-6)
-    err_sd = 1.0 / np.sqrt(den + 1.0 / ridge_sd ** 2)
-    nn = np.zeros(K, int)
-    ns = [set() for _ in range(K)]
-    for d in data:
-        np.add.at(nn, d["k"], 1)
-        for k in d["k"]:
-            ns[k].add(d["tid"])
-    w = den > 0
-    s_err = float(np.sqrt(np.average(err[w] ** 2, weights=den[w]))) if w.any() else float(ridge_sd)
-    offs = None
-    if kind == "star":
-        v = []
-        for j, d in enumerate(data):
-            s = d["sol"]
-            if s.z_star is not None and s.z_inst is not None:
-                v.append(float(np.nanmedian(s.z_star - s.z_inst)) + c[j])
-        if v:
-            offs = dict(median=float(np.median(v)), scatter=float(1.4826 * np.median(np.abs(
-                np.asarray(v) - np.median(v)))) if len(v) > 2 else None, n=len(v),
-                oh_scale_systematic=-0.021)
-    import datetime
-
-    sets = {}
-    for t in tids:
-        dd = [d for d in data if d["tid"] == t]
-        sets[t] = dict(coef=T[t], xr=dd[0]["xr"], mr=dd[0]["mr"], nights=[d["name"] for d in dd])
-    return LineScale(kind=kind, mode=modes.pop(), q=(int(q[0]), int(q[1])),
-                     lref=np.array([k[1] for k in keys], np.float64),
-                     order=np.array([k[0] for k in keys], int), err=err, err_sd=err_sd,
-                     n_nights=nn, n_sets=np.array([len(x) for x in ns], int),
-                     tau=float(math.sqrt(tau2)), s_err=s_err, sets=sets,
-                     night_offsets={d["name"]: float(c[j]) for j, d in enumerate(data)},
-                     gauge=_SCALE_NOTES[kind], offset_vs_oh=offs,
-                     meta=dict(created=datetime.datetime.now(datetime.timezone.utc).isoformat(
-                         timespec="seconds"), ridge_sd=ridge_sd, n_iter=n_iter, huber=huber))
-
-
-@_quiet
-def _rescale_part(part: dict, scale: LineScale, template, sols) -> dict:
-    """Re-express a surface part (:func:`_build_part`) on a :class:`LineScale`: line offsets
-    ``err_k + T_s(x_k)`` (lines not in the scale: the set's offsets moved onto the scale by the
-    weighted mean difference over the common lines), surface ``T_s`` (no constant), ``tau`` /
-    ``s_line`` of the scale, the star slit prior re-gauged by the nights' scale offsets."""
-    tid = _template_id(template)
-    L = part["lines"]
-    order, lref = np.asarray(L["order"], int), np.asarray(L["lref"], np.float64)
-    x = np.asarray(L["x"], np.float64)
-    M, Me = np.asarray(L["mu"], np.float64), np.asarray(L["mu_err"], np.float64)
-    q = tuple(scale.q)
-    xr = tuple(float(v) for v in template.p_range(int(template.orders[0])))
-    mr = (float(min(template.orders)), float(max(template.orders)))
-    B = _scale_basis(x, order, xr, mr, q)
-    err, esd, hit = scale.lookup(lref, order)          # per (order, line): see LineScale.lookup
-    st = scale.set_term(tid)
-    if st is not None:
-        Tc = np.asarray(st["coef"], np.float64)
-        source = "scale"
-    else:                       # a set the scale has not seen: fit T_s to (M - err) here
-        ok = hit & np.isfinite(M)
-        w = 1.0 / (np.where(np.isfinite(Me), Me, 0.05) ** 2 + scale.tau ** 2)
-        A = np.column_stack([np.ones(ok.sum()), B[ok]])
-        Tc = np.linalg.lstsq(A * np.sqrt(w[ok])[:, None], (M[ok] - err[ok]) * np.sqrt(w[ok]),
-                             rcond=None)[0][1:] if ok.sum() > 3 * (B.shape[1] + 1) else \
-            np.zeros(B.shape[1])
-        source = "fitted"
-    S = B @ Tc
-    new = np.where(hit, err + S, np.nan)
-    ok = hit & np.isfinite(M)
-    w = 1.0 / (np.where(np.isfinite(Me), Me, 0.05) ** 2 + scale.tau ** 2)
-    dc = float(np.sum(w[ok] * (M[ok] - new[ok])) / np.sum(w[ok])) if ok.any() else 0.0
-    new = np.where(hit, new, M - dc)
-    nerr = np.where(hit, np.sqrt(esd ** 2 + 1e-6), Me)
-    Lout = dict(L, mu=new, mu_err=nerr)
-    # every other line of the scale that falls on this template gets its scale prior too
-    seen = {(int(o), round(float(v), 3)) for o, v in zip(order, lref, strict=True)}
-    add = {k: [] for k in ("order", "lref", "mu", "mu_err", "x")}
-    for m in template.orders:
-        a, b = template.p_range(int(m))
-        lo, hi = sorted(float(v) for v in template.lam(int(m), np.array([a, b])))
-        # the scale's entries of THIS order only (an overlap line has one entry per order)
-        sel = np.where((scale.order == int(m)) & (scale.lref > lo) & (scale.lref < hi))[0]
-        for i in sel:
-            if (int(m), round(float(scale.lref[i]), 3)) in seen:
-                continue
-            xm = float(template.p_of_lam(int(m), np.array([scale.lref[i]]))[0])
-            add["order"].append(int(m))
-            add["lref"].append(float(scale.lref[i]))
-            add["mu"].append(float(scale.err[i] + (_scale_basis([xm], [m], xr, mr, q) @ Tc)[0]))
-            add["mu_err"].append(float(np.sqrt(scale.err_sd[i] ** 2 + 1e-6)))
-            add["x"].append(xm)
-    if add["lref"]:
-        na = len(add["lref"])
-        for k in Lout:
-            v = np.asarray(Lout[k])
-            if k in add:
-                Lout[k] = np.concatenate([v, np.asarray(add[k], v.dtype if v.dtype != object
-                                                        else np.float64)])
-            elif v.dtype.kind in "fc":
-                Lout[k] = np.concatenate([v, np.full(na, np.nan)])
-            elif v.dtype.kind in "iu":
-                Lout[k] = np.concatenate([v, np.zeros(na, v.dtype)])
-            else:
-                Lout[k] = np.concatenate([v.astype(str), np.full(na, "")])
-    coef = np.zeros((q[0], q[1]))
-    coef.ravel()[1:] = Tc
-    out = dict(part, coef=coef, q=q, xr=xr, mr=mr, gauge="scale", tau=float(scale.tau),
-               s_line=float(scale.s_err),
-               lines=Lout, rms_about_surface=float(np.sqrt(np.nanmean(
-                   (np.where(hit, err, np.nan)) ** 2))),
-               scale=dict(kind="table", id=scale.id, line_kind=scale.kind, gauge=scale.gauge,
-                          n_matched=int(hit.sum()), n_lines=int(hit.size),
-                          n_added=len(add["lref"]), set_term=source,
-                          set_offset_vs_scale=dc, offset_vs_oh=scale.offset_vs_oh))
-    if part.get("slit") is not None and sols:
-        vals = []
-        for s in sols:
-            c_n = scale.night_offsets.get(s.name)
-            v = s.diagnostics.get("star_minus_inst_median") if s.diagnostics else None
-            if c_n is not None and v is not None and np.isfinite(v):
-                vals.append(float(v) + c_n)
-        if vals:
-            sc = (1.4826 * float(np.median(np.abs(np.asarray(vals) - np.median(vals))))
-                  if len(vals) > 2 else float("nan"))
-            out["slit"] = dict(median=float(np.median(vals)),
-                               scatter=sc if np.isfinite(sc) and sc > 0 else None, n=len(vals),
-                               values=vals)
-    return out
 
 
 def surface_from_warp_reductions(roots, *, calib: str = "", config: AnchorConfig | None = None,
@@ -3927,59 +3217,6 @@ def anchored_zero_points(d, e, *, groups=None, valid=None, prior_mu=None, prior_
 
 
 # --------------------------------------------------------------- per-group measurement
-def _masked_ivar(sset: SpectrumSet, template, centers: dict, halfw: dict, v0) -> dict:
-    """``ivar`` (F, n) per order: ``sset.ivar`` (or 1) set to 0 within +- ``halfw[m]`` km/s of every
-    vacuum line centre ``centers[m]`` seen at velocity ``v0[f]`` km/s (raw pixel wavelengths)."""
-    v0 = np.broadcast_to(np.asarray(v0, np.float64), (sset.n_frames,))
-    out = {}
-    for m in sset.orders:
-        raw = sset.raw_lambda(m, template)
-        F, n = raw.shape
-        base = np.ones((F, n)) if sset.ivar is None or m not in sset.ivar else \
-            np.array(sset.ivar[m], np.float64)
-        c = np.asarray(centers.get(m, ()), np.float64)
-        if c.size:
-            h = np.asarray(halfw[m], np.float64)
-            o = np.argsort(c)
-            c, h = c[o], h[o]
-            for f in range(F):
-                cf = c * (1.0 + v0[f] / C_KMS)
-                lo = np.searchsorted(raw[f], cf * (1.0 - h / C_KMS))
-                hi = np.searchsorted(raw[f], cf * (1.0 + h / C_KMS))
-                cov = np.zeros(n + 1)
-                np.add.at(cov, lo, 1.0)
-                np.add.at(cov, hi, -1.0)
-                base[f, np.cumsum(cov)[:n] > 0] = 0.0
-        out[m] = base
-    return out
-
-
-def _aonly_sets(obj: SpectrumSet, template, lines: LineTable, cfg, v_sky, v_obj):
-    """A-only frames: the object flux as the OH ('sky') spectrum with the modelled telluric
-    lines masked, and as the object spectrum with the OH lines masked (each at the frame's
-    initial zero point)."""
-    fw = cfg.fwhm
-    tc, th, oc, oh_ = {}, {}, {}, {}
-    for m in obj.orders:
-        lam = np.asarray(obj.lam[m], np.float64)
-        lo, hi = float(np.nanmin(lam)) - 5.0, float(np.nanmax(lam)) + 5.0
-        a = lines.absorber_lines(lo, hi, species=("H2O", "O2"), R=cfg.R, p_eff=dict(cfg.p_eff))
-        k = a["depth"] >= cfg.aonly_tell_depth
-        tc[m] = a["lam"][k]
-        th[m] = cfg.aonly_tell_halfwidth * fw * (1.0 + np.clip(a["depth"][k] / 0.2, 0.0, 2.0))
-        o = lines.oh_lines(lo, hi, positions=cfg.oh_positions)
-        k = o["I"] >= cfg.aonly_oh_imin
-        oc[m] = o["lam"][k]
-        oh_[m] = np.full(int(k.sum()), cfg.aonly_oh_halfwidth * fw)
-
-    def mk(kind, iv):
-        return SpectrumSet(kind=kind, lam=obj.lam, flux=obj.flux, time=obj.time, nod=obj.nod,
-                           epoch=obj.epoch, ivar=iv, shift_px=obj.shift_px,
-                           frame_ids=obj.frame_ids)
-    return (mk("sky", _masked_ivar(obj, template, tc, th, v_sky)),
-            mk("obj", _masked_ivar(obj, template, oc, oh_, v_obj)))
-
-
 def _aonly_exclude(feats_by_order: dict, lines: LineTable, cfg, kind: str) -> dict:
     """A-only frames: drop the features whose fit window (+- margin) holds a contaminating line
     (``kind="oh"``: OH features vs telluric lines deeper than ``aonly_tell_depth``;
@@ -3999,7 +3236,7 @@ def _aonly_exclude(feats_by_order: dict, lines: LineTable, cfg, kind: str) -> di
             c = a["lam"][a["depth"] >= cfg.aonly_tell_depth]
             mg = cfg.aonly_tell_halfwidth * fw
         else:
-            o = lines.oh_lines(lo, hi, positions=cfg.oh_positions)
+            o = lines.oh_lines(lo, hi)
             c = o["lam"][o["I"] >= cfg.aonly_oh_imin]
             mg = cfg.aonly_oh_halfwidth * fw
         keep = []
@@ -4155,7 +3392,7 @@ def _solve_lines(col, template, cfg, *, part=None, regs=None, self_prior=False, 
     pat = None
     if part is not None:
         mu_p, var_p, matched = _part_prior(part, template, order, lref)
-        pat = (_part_pattern(part, template, order, lref, drift=cfg.use_surface_drift)
+        pat = (_part_pattern(part, template, order, lref, drift=False)
                if cfg.use_surface_modes else None)
         if pat is not None and regs is not None:
             pn, pd, X0 = pat[:3]
@@ -4235,22 +3472,18 @@ def _measure_static(sset, template, feats_by_order, d0_frame, groups, cfg, *, si
 
 def _epoch_design(sset: SpectrumSet, groups, model: str):
     """(F, P) zero-point design of an epoch model (:func:`anchored_zero_points` ``design``):
-    ``"frame"`` -> None (free per-frame zero points); ``"nod"`` -> ``1, nod_f`` (one zero point
-    and an A/B term per epoch group); ``"nod_drift"`` -> ``1, nod_f, t_f - <t>_group`` [h]."""
+    ``"frame"`` -> None (free per-frame zero points); ``"nod_drift"`` -> ``1, nod_f,
+    t_f - <t>_group`` [h] (one zero point, an A/B term and a drift per epoch group)."""
     if model == "frame":
         return None
-    if model not in ("nod", "nod_drift"):
-        raise ValueError(f"epoch_model={model!r}: 'frame', 'nod' or 'nod_drift'")
-    F = sset.n_frames
-    cols = [np.ones(F), _nod_code(sset.nod)]
-    if model == "nod_drift":
-        g = np.asarray(groups)
-        t = np.zeros(F)
-        for gg in np.unique(g):
-            fr = g == gg
-            t[fr] = (sset.time[fr] - sset.time[fr].mean()) * 24.0
-        cols.append(t)
-    return np.column_stack(cols)
+    if model != "nod_drift":
+        raise ValueError(f"epoch_model={model!r}: 'frame' or 'nod_drift'")
+    g = np.asarray(groups)
+    t = np.zeros(sset.n_frames)
+    for gg in np.unique(g):
+        fr = g == gg
+        t[fr] = (sset.time[fr] - sset.time[fr].mean()) * 24.0
+    return np.column_stack([np.ones(sset.n_frames), _nod_code(sset.nod), t])
 
 
 def _design_out(res):
@@ -4344,7 +3577,7 @@ def anchor_frames(night: NightSpectra, config: AnchorConfig | None = None, *,
     A-only frames (``night.sky is None``: ``decanter.reduce(sky=None)``, no nod partner): the
     object spectrum still holds the OH airglow, so the OH zero point is measured on it (same
     exposure: ``z_inst = z_sky``, no drift term); features whose window holds a contaminating
-    line of the other kind are dropped (``config.aonly_contaminants``).  ``config.epoch_model``
+    line of the other kind are dropped .  ``config.epoch_model``
     (``"sparse"`` only) replaces the free per-frame zero points of each epoch group by
     ``1, nod [, t]`` (:func:`_epoch_design`; coefficients in ``diagnostics["tell_epoch_coef"]`` /
     ``["oh_epoch_coef"]``).
@@ -4402,23 +3635,17 @@ def anchor_frames(night: NightSpectra, config: AnchorConfig | None = None, *,
         dglob[j] = d_glob
         n_bad += int(np.sum(~good))
     obj_fit = obj
-    if aonly and cfg.aonly_contaminants == "mask":     # zero-weight the contaminated pixels
-        sky, obj_fit = _aonly_sets(obj, tmpl, lines, cfg, d0, d0)
-    elif aonly and cfg.aonly_contaminants not in ("exclude", "none"):
-        raise ValueError(f"aonly_contaminants={cfg.aonly_contaminants!r}: 'exclude', 'mask' or "
-                         "'none'")
     timing["xcorr"] = time.perf_counter() - t_start
     # ---------------------------------------------------------------- (2) OH
     feats = {}
     for m in sky.orders:
         lam = np.asarray(sky.lam[m])
         fs = build_oh_features(lines, float(np.nanmin(lam)), float(np.nanmax(lam)), cfg.R,
-                               imin=cfg.oh_imin, risk_max=cfg.oh_risk, pad=cfg.oh_pad,
-                               positions=cfg.oh_positions)
+                               imin=cfg.oh_imin, risk_max=cfg.oh_risk, pad=cfg.oh_pad)
         lo_ok = np.nanmin(lam) * (1 + (cfg.xcorr_vmax + fw * (cfg.oh_pad + 1)) / C_KMS)
         hi_ok = np.nanmax(lam) * (1 - (cfg.xcorr_vmax + fw * (cfg.oh_pad + 1)) / C_KMS)
         feats[m] = [f for f in fs if f["clean"] and lo_ok < f["lref"] < hi_ok]
-    if aonly and cfg.aonly_contaminants == "exclude":
+    if aonly:
         feats = _aonly_exclude(feats, lines, cfg, "oh")
     t1 = time.perf_counter()
     sparse_self = method == "sparse" and G > 1
@@ -4440,7 +3667,7 @@ def anchor_frames(night: NightSpectra, config: AnchorConfig | None = None, *,
         oh = _solve_lines(col, tmpl, cfg, part=part_sky, regs=dict(nod=nod_sky, X=X_sky),
                           self_prior=sparse_self, label=f"{night.name} sky", design=des_sky)
     sky_surface = part_sky is not None and not oh["surface_rejected"]
-    if sky_surface and oh["pattern"] is not None and not cfg.use_surface_drift:
+    if sky_surface and oh["pattern"] is not None:
         X_sky = np.full(F, float(part_sky["modes"].get("X0", 0.0)))   # nod pattern only
     timing["oh_fits"] = time.perf_counter() - t1
     z_sky = oh["z"].copy()
@@ -4541,7 +3768,7 @@ def anchor_frames(night: NightSpectra, config: AnchorConfig | None = None, *,
                                          blend_max=cfg.tell_blend, halfwin=cfg.tell_halfwin,
                                          risk_max=cfg.tell_risk)
             tfeats[m] = [f for f in tf if f["clean"]]
-        if aonly and cfg.aonly_contaminants == "exclude":
+        if aonly:
             tfeats = _aonly_exclude(tfeats, lines, cfg, "tell")
         d0o = np.where(np.isfinite(z_inst), z_inst, d0[pair])
         nod_obj = _nod_code(obj.nod)
@@ -4558,10 +3785,10 @@ def anchor_frames(night: NightSpectra, config: AnchorConfig | None = None, *,
             "modes") else 0.0
         if star_surface and te["pattern"] is not None:
             star_modes = _pattern_modes(part_star["modes"], np.column_stack(
-                [nod_obj, d0o if cfg.use_surface_drift else np.full(obj.n_frames, X0s)]))
+                [nod_obj, np.full(obj.n_frames, X0s)]))
         if oh_modes is not None and sky_surface:
-            oh_modes["R_obj"] = np.column_stack([nod_obj, z_inst if cfg.use_surface_drift else
-                                                 np.full(obj.n_frames, oh_modes["reg_mean"][1])])
+            oh_modes["R_obj"] = np.column_stack([nod_obj, np.full(obj.n_frames,
+                                                                      oh_modes["reg_mean"][1])])
         timing["tell_fits"] = time.perf_counter() - t3
         slit = None if surf is None or surf.star is None else surf.star.get("slit")
         off = float(slit["median"]) if slit else 0.0

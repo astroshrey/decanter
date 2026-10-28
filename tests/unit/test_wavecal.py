@@ -100,15 +100,6 @@ def test_template_inverse_and_derivative():
         h = 1e-3
         fd = (T.lam(m, p + h) - T.lam(m, p - h)) / (2 * h)
         assert np.max(np.abs(fd - T.dlam_dp(m, p))) < 1e-7
-        assert np.max(np.abs(T.lam_xp(np, m, p) - lam)) < 1e-9
-    jnp = jax.numpy
-    from decanter.wavecal._xp import get_backend
-
-    get_backend("jax", "float64")
-    lj = np.asarray(T.lam_xp(jnp, 163, jnp.asarray(p)))
-    assert np.max(np.abs(lj - T.lam(163, p))) < 1e-9
-    g = np.asarray(jax.vmap(jax.grad(lambda q: T.lam_xp(jnp, 163, q)))(jnp.asarray(p)))
-    assert np.max(np.abs(g - T.dlam_dp(163, p))) < 1e-9
     grid = static_lnlam_grid(T, 163, dv_kms=1.5)
     assert grid.dtype == np.float64
     assert np.allclose(np.diff(np.log(grid)) * C_KMS, 1.5, rtol=1e-9)
