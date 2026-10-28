@@ -28,7 +28,6 @@ User-facing API:
         WARP reduction root (a root also loads frame NO1's aperture DBs,
         which lock extraction to NO1's trace; it warns when it does).
 
-See ``docs/BITEXACT.md`` for what is verified against WARP.
 """
 
 __version__ = "1.1.0"

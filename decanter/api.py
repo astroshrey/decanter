@@ -54,7 +54,7 @@ _OBJNAME_BAD_CHARS: tuple[str, ...] = (" ", "'", "\"", "#", "/")
 # "default": no cross-frame waveshift; the OH + telluric wavelength
 # calibration (decanter.wavecal) puts every frame on the true telluric scale.
 # "warp-clone": WARP to the bit (its cross-correlation shift as configured,
-# no wavecal; docs/BITEXACT.md).
+# no wavecal).
 MODES: tuple[str, ...] = ("default", "warp-clone")
 
 
@@ -267,7 +267,7 @@ def reduce(
             path; with a stored :class:`~decanter.wavecal.StaticSurface` of
             the calibration set when there is one) moves every order onto
             its true telluric wavelength scale through the s11 shift.
-            ``"warp-clone"``: WARP to the bit (``docs/BITEXACT.md``),
+            ``"warp-clone"``: WARP to the bit,
             ``shift_wave`` as given. Any other value raises ``ValueError``.
             Both run the vectorised implementation (:mod:`decanter.fast`;
             the rectification on the Apple GPU via MLX when installed).
@@ -304,7 +304,7 @@ def reduce(
     ``CUTRANSFORM flux: yes`` (any case, or ``y``) multiplies the rectified
     strips by the transform's Jacobian; ``Extract 2d spectrum: yes`` adds the
     2-D spectra (``Reduction.obj_2d`` and ``Reduction.obj_2d_resample``). All
-    three follow WARP bit for bit (docs/BITEXACT.md).  Every IRAF task port
+    three follow WARP bit for bit.  Every IRAF task port
     reads its input images as IRAF's FITS kernel does (``-0.0``,
     subnormals, ``+-Inf``/NaN -> ``+0``; :mod:`decanter.utils.iraf_imio`).
 
@@ -472,7 +472,7 @@ def reduce(
     # The background regions and the 2-D strips (resample2Dspec reads
     # twice the aperture around the trace) can read off-band pixels,
     # where the MLX backend's float32 subnormals may differ from WARP
-    # (docs/VECTORISED.md): with those options rectify on the CPU (exact).
+    # with those options rectify on the CPU (exact).
     rect_backend = "numpy" if warp_opts else None
     rect = _fast_rectify.rectify_orders_multi(
         [sscfm_in] + ([fm_in] if fm_in is not None else []), apset_multi,

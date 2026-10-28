@@ -16,7 +16,7 @@ grid and FSR cuts -- with WARP's arithmetic, restructured:
 
 Everything else (s01, s03-s05, s07 center search, s10, s11, s13) is the
 stage-by-stage port's own code. The results are bit-identical to WARP
-(``docs/VECTORISED.md``; on the MLX backend up to float32 subnormals in s06
+(on the MLX backend up to float32 subnormals in s06
 strip pixels the extraction never reads).
 
 Backends: s06 runs on the Apple GPU through MLX when ``mlx`` imports and has a

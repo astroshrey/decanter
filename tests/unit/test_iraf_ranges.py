@@ -3,7 +3,7 @@
 The expected values were produced by IRAF's compiled ``ctod_``/``ctor_``
 (libsys.a of this Mac's iraf-community v2.18.1 build, called through ctypes);
 the port matched them on 755,750 (string, position) cases and
-``rg_xranges`` + ``rg_order`` + ``rg_merge`` on 120,084 (docs/BITEXACT.md).
+``rg_xranges`` + ``rg_order`` + ``rg_merge`` on 120,084.
 """
 from __future__ import annotations
 

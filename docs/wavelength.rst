@@ -74,5 +74,4 @@ calibration, every frame's line sits at its rest position:
    :width: 100%
 
 Across 59 WARP nights the frame-to-frame scatter of the line centre drops from
-a median of 152 to 77 m/s. The method and its validation record are in
-``docs/WAVECAL.md`` in the repository.
+a median of 152 to 77 m/s.

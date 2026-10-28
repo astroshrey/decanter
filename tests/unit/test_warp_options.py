@@ -5,7 +5,7 @@ Self-contained checks of the IRAF primitives and of the scalar
 strips; with ``reductions/TOI2109_decanterref`` present, the same on WARP's
 rectified strips and the transform's flux path against its reference.
 Bit-identity with WARP itself is checked by ``scripts/bitexact_checks/
-warp_options.py`` against fresh WARP runs (docs/BITEXACT.md).
+warp_options.py`` against fresh WARP runs.
 """
 from __future__ import annotations
 

@@ -9,7 +9,7 @@ and reported separately:
   differences), and the number of HDUs.  A per-frame FSR-cut ``VAC``
   spectrum whose only difference is its last value (header identical) is
   the documented s13 tail pixel (WARP's uninitialised memory when
-  ``n_r < n``, docs/BITEXACT.md), counted as ``tail`` and not as a
+  ``n_r < n``), counted as ``tail`` and not as a
   difference -- unless the WARP tree kept that frame's s12 spectrum
   (``4-OBJ-1DSPEC_dispcor/*_m<m>csw``, ``7-SKY_dispcor/*_m<m>trans1dcutw``)
   and its header WCS says the cut is not ``n_r < n`` (``scopy_wcs`` with

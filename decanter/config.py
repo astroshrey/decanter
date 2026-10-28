@@ -196,8 +196,7 @@ def apall_background(value: str) -> str:
     ``me``..``median``, ``mi``..``minimum``, ``f``..``fit``, ``n``..``none``.
 
     Checked with pyraf 2.2.4 in WARP's environment (``echelle.apall``
-    ``setParam``), and by WARP runs with ``med`` and ``no``
-    (docs/BITEXACT.md).
+    ``setParam``), and by WARP runs with ``med`` and ``no``.
     """
     return pyraf_choice(value, BACKGROUND_MODES, "Background Subtraction")
 

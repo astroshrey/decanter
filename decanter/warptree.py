@@ -1076,7 +1076,7 @@ def reduce_to_warp_tree(
     if fast_backend == "mlx" and (save or background_mode(cfg) != "none"
                                   or cfg.flag_extract2d):
         # The MLX rectification differs from WARP in float32 subnormals of
-        # strip pixels outside every extraction band (docs/VECTORISED.md);
+        # strip pixels outside every extraction band;
         # -s writes those whole strips, and the background regions and
         # 2-D strips may read them, so rectify on the CPU (exact).
         fast_backend = "numpy"

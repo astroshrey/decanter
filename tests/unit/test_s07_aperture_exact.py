@@ -32,7 +32,7 @@ def _random_problem(rng):
 
 
 # The one-pass binning reproduces NumPy's np.median as built for arm64 (the
-# machine WARP's references were made on, docs/BITEXACT.md); x86 NumPy builds
+# machine WARP's references were made on); x86 NumPy builds
 # vectorise it differently.
 _ARM64_ONLY = pytest.mark.skipif(
     platform.machine().lower() not in ("arm64", "aarch64"),

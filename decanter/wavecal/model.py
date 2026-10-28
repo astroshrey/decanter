@@ -67,7 +67,6 @@ Conventions
   everything that is fitted (centroids, decomposition, GP marginal likelihood);
   ``jax.lax``/``jax.jacfwd`` are used directly where the shim has no equivalent.
 
-Method details, the line list's provenance and the validation record: ``docs/WAVECAL.md``.
 """
 from __future__ import annotations
 

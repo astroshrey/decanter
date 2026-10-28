@@ -282,7 +282,7 @@ def test_dispcor_edges_fast_identical():
 # --- s02 CR mask: WARP factor map, vectorised (synthetic) ------------------------
 
 # The emulation reproduces NumPy's float32 reductions as built for arm64 (the
-# machine WARP's references were made on, docs/BITEXACT.md); x86 NumPy builds
+# machine WARP's references were made on); x86 NumPy builds
 # vectorise these reductions differently.
 _ARM64_ONLY = pytest.mark.skipif(
     platform.machine().lower() not in ("arm64", "aarch64"),
