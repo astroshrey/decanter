@@ -51,9 +51,6 @@ decanter.reduce_to_warp_tree("TOI836.txt", "science_data/2025_02_15",
                              paramfile="nominal_params.txt", waveshift=True)
 ```
 
-Compare two such trees file by file with
-`python -m decanter.compare_full_tree WARP_ROOT DECANTER_ROOT --bytes`.
-
 ## Modes
 
 - `mode="warp"` (default): the WARP clone, vectorised and calibration-cached,
