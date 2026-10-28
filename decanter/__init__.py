@@ -2,7 +2,7 @@
 
 User-facing API:
 
-    decanter.reduce(obj, calib, *, sky=None, mode="warp", workdir=None, ...)
+    decanter.reduce(obj, calib, *, sky=None, mode="default", workdir=None, ...)
         Single-frame reduction. Returns a :class:`Reduction` with
         per-(fsr_cut, order) calibrated 1D spectra. Composes
         :mod:`decanter.image2d` → :mod:`decanter.rectify` →
@@ -10,7 +10,7 @@ User-facing API:
         cross-frame waveshift (waveshift is relative across frames
         and meaningless for a single frame).
 
-    decanter.reduce_many(pairs, calib, *, mode="warp", ...)
+    decanter.reduce_many(pairs, calib, *, mode="default", ...)
         Reduce a list of frame pairs and align them with WARP's cross-frame
         wavelength shift.
 

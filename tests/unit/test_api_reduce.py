@@ -55,7 +55,7 @@ def test_reduce_many_aligns_and_combines() -> None:
     Reducing the same pair twice gives a 2-frame series with zero relative
     shift; the combined master matches the per-frame spectra."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    series = decanter.reduce_many([(_RAW_OBJ, _RAW_SKY), (_RAW_OBJ, _RAW_SKY)], calib)
+    series = decanter.reduce_many([(_RAW_OBJ, _RAW_SKY), (_RAW_OBJ, _RAW_SKY)], calib, mode="warp-clone")
     assert len(series.reductions) == 2
     assert series.shifts.shape == (2,)
     assert abs(float(series.shifts[series.refid])) < 1e-9      # reference shift is 0
@@ -77,7 +77,7 @@ def test_reduce_matches_warp_on_toi2109_decanterref_m163_fsr105() -> None:
     for m163 within the s06+s08 algorithmic noise floor (medrel < 0.01%,
     same shape, same CRVAL1)."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY)
+    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY, mode="warp-clone")
     spec = r.obj[(1.05, 163)]
 
     warp_data = fits.getdata(_WARP_M163_FSR105).astype(np.float64)
@@ -103,8 +103,7 @@ def test_reduce_returns_intermediates_when_requested(tmp_path: Path) -> None:
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
     r = decanter.reduce(
         _RAW_OBJ, calib, sky=_RAW_SKY,
-        workdir=tmp_path, save_intermediates=True,
-    )
+        workdir=tmp_path, save_intermediates=True, mode="warp-clone")
     # 2D intermediates exist:
     assert r.intermediates.obj_s is not None
     assert r.intermediates.obj_sscfm is not None
@@ -121,7 +120,7 @@ def test_reduce_returns_intermediates_when_requested(tmp_path: Path) -> None:
 def test_reduce_orders_property_lists_26_orders() -> None:
     """Default Config processes all 26 orders 159..184."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY)
+    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY, mode="warp-clone")
     assert r.orders == tuple(range(159, 185))
     assert r.fsr_cuts == (1.05, 1.3)
 
@@ -144,8 +143,8 @@ def test_standalone_trace_matches_warp_locked() -> None:
     assert calib_locked.ref_trans_apdbs, "fixture should carry multihole trans refs"
     calib_standalone = dataclasses.replace(calib_locked, trans_apdbs=None)
 
-    r_locked = decanter.reduce(_RAW_OBJ, calib_locked, sky=_RAW_SKY)
-    r_standalone = decanter.reduce(_RAW_OBJ, calib_standalone, sky=_RAW_SKY)
+    r_locked = decanter.reduce(_RAW_OBJ, calib_locked, sky=_RAW_SKY, mode="warp-clone")
+    r_standalone = decanter.reduce(_RAW_OBJ, calib_standalone, sky=_RAW_SKY, mode="warp-clone")
 
     worst = 0.0
     for key, spec in r_locked.obj.items():
@@ -179,8 +178,8 @@ def test_locked_path_without_db_for_an_order_solves_that_order() -> None:
     part = dataclasses.replace(
         full, trans_apdbs={m: p for m, p in full.trans_apdbs.items() if m != 163})
     cfg = decanter.Config(selected_orders=(162, 163), reduce_full_data=False)
-    r_full = decanter.reduce(_RAW_OBJ, full, sky=_RAW_SKY, config=cfg)
-    r_part = decanter.reduce(_RAW_OBJ, part, sky=_RAW_SKY, config=cfg)
+    r_full = decanter.reduce(_RAW_OBJ, full, sky=_RAW_SKY, config=cfg, mode="warp-clone")
+    r_part = decanter.reduce(_RAW_OBJ, part, sky=_RAW_SKY, config=cfg, mode="warp-clone")
     for cut in r_full.fsr_cuts:
         assert np.array_equal(r_part.obj[(cut, 162)].flux, r_full.obj[(cut, 162)].flux)
         assert np.isfinite(r_part.obj[(cut, 163)].flux).all()
@@ -194,17 +193,17 @@ def test_reduce_a_only_no_sky() -> None:
     resolved for the center-search aperture solve (regression for a NameError
     on ``nodpos`` when the CR-mask branch was skipped)."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    r = decanter.reduce(_RAW_OBJ, calib)                       # no sky
+    r = decanter.reduce(_RAW_OBJ, calib, mode="warp-clone")                       # no sky
     assert (1.05, 163) in r.obj and r.obj[(1.05, 163)].flux.size > 0
-    r_bg = decanter.reduce(_RAW_OBJ, calib, subtract_background=True)
+    r_bg = decanter.reduce(_RAW_OBJ, calib, subtract_background=True, mode="warp-clone")
     assert (1.05, 163) in r_bg.obj and r_bg.obj[(1.05, 163)].flux.size > 0
 
 
 def test_reduce_rejects_unimplemented_mode() -> None:
-    """Only 'warp' (default), 'warp-reference' and the 'fast' alias exist; other
-    recipes raise before any I/O."""
+    """Only 'default' and 'warp-clone' exist; other modes raise before any I/O."""
     import pytest
 
     import decanter
-    with pytest.raises(ValueError, match="not implemented"):
-        decanter.reduce("obj.fits", None, mode="default")
+    for bad in ("warp", "warp-reference", "fast"):
+        with pytest.raises(ValueError, match="not a decanter mode"):
+            decanter.reduce("obj.fits", None, mode=bad)

@@ -154,7 +154,7 @@ def test_aonly_single_frame_recovers_zero_points():
 
 
 def test_anchor_reduction_aonly_dispatch():
-    """A decanter.reduce(sky=None)-style Reduction (sky = {}, no sky header) anchors through
+    """A decanter.reduce(sky=None, mode="warp-clone")-style Reduction (sky = {}, no sky header) anchors through
     anchor_reduction on the A-only path."""
     rng = np.random.default_rng(23)
     t_mid = 60895.0 + (3600.0 + 150.0) / 86400.0
@@ -182,7 +182,7 @@ def test_anchor_reduction_aonly_dispatch():
 
 @pytest.mark.regression
 def test_aonly_real_frame_toi2109():
-    """decanter.reduce(sky=None) on a raw TOI-2109 A frame -> anchor_reduction: z_inst within
+    """decanter.reduce(sky=None, mode="warp-clone") on a raw TOI-2109 A frame -> anchor_reduction: z_inst within
     3 sigma of the night's series OH model at that exposure, z_star within 3 sigma of the WARP
     A-B frame's single-frame telluric zero point."""
     import decanter
@@ -195,7 +195,7 @@ def test_aonly_real_frame_toi2109():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         calib = decanter.Calibration.from_dir(ref)
-        r = decanter.reduce(raw, calib, sky=None)
+        r = decanter.reduce(raw, calib, sky=None, mode="warp-clone")
         a = anchor_reduction(r, calib, surface=None)
         night = load_warp_night(RED / "TOI2109")
         ser = anchor_night(night)

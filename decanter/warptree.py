@@ -595,7 +595,7 @@ class _FramePart:
 
 
 def _backend_label(name: str | None) -> str | None:
-    """``"numpy"``, ``"mlx <version>"``, or None (mode="warp-reference")."""
+    """``"numpy"``, ``"mlx <version>"``, or None."""
     if name == "mlx":
         try:
             from importlib.metadata import version
@@ -616,15 +616,13 @@ def _frame_worker(job: dict) -> _FramePart:
         from decanter.fast._backend import set_backend
         set_backend(job["fast_backend"])
     t0 = time.time()
-    # mode="warp" (vectorised) keeps the 1-D extractions without
-    # save_intermediates (which would make it rectify whole strips);
-    # warp-reference keeps them only with save_intermediates. WARP's -s
-    # (save) needs every 2-D intermediate, whole strips included.
-    save_inter = job["mode"] != "warp" or job.get("save", False)
+    # the 1-D extractions are always kept; WARP's -s (save) needs every 2-D
+    # intermediate, whole strips included
+    save_inter = job.get("save", False)
     # the 4-OBJ_mask cosmic-ray extras (mf1, mf2, noise) only when written
     wp = "mask" if (job.get("intermediates") or job.get("save")) else True
     r = decanter.reduce(Path(job["obj"]), job["calib"], sky=Path(job["sky"]),
-                        config=job["config"], mode=job["mode"],
+                        config=job["config"], mode="warp-clone",
                         save_intermediates=save_inter,
                         check_calib=job["check_calib"],
                         aperture=job.get("aperture"), background_region=job.get("bg"),
@@ -952,7 +950,7 @@ def reduce_to_warp_tree(
     calib: Calibration | Path | str,
     dest_dir: Path | str,
     *,
-    mode: str = "warp",
+    mode: str = "default",
     config: Config | None = None,
     paramfile: Path | str | None = None,
     apertures: str | Path = "solve",
@@ -965,7 +963,8 @@ def reduce_to_warp_tree(
     save: bool = False,
     rawdata: bool = True,
     plots: bool = True,
-    waveshift: bool | None = False,
+    waveshift: bool | None = None,
+    wavecal_check: bool = True,
 ) -> WarpTree:
     """Reduce every frame of a listfile and write WARP's directory layout.
 
@@ -978,13 +977,19 @@ def reduce_to_warp_tree(
             ``apertures`` says so).
         dest_dir: output root (``reductions/<testname>``). Must not exist
             unless ``overwrite`` (then it is replaced).
-        mode: reduction recipe passed to :func:`decanter.reduce`: ``"warp"``
-            (default: the WARP clone, vectorised and GPU-accelerated;
-            ``docs/VECTORISED.md``), ``"warp-reference"`` (its scalar reference
-            implementation, ``docs/BITEXACT.md``). The tree is the same for every mode; each spectrum's
-            ``DECANTER`` card names the mode and
-            ``reduction_log/decanter_provenance.json`` the implementation and
-            backend that ran.
+        mode: ``"default"``: WARP's pipeline without its cross-frame shift,
+            then the night's OH + telluric wavelength calibration
+            (:mod:`decanter.wavecal`) applied in place through the s11 shift,
+            per frame and order, so every product of the tree (VAC / AIR /
+            norm / cont, the sums) is on the true telluric wavelength scale;
+            ``reduction_log/`` gets ``decanter_wavecal.json`` (per-frame
+            velocities) and ``decanter_wavecal_telluric.png`` (a strong H2O
+            line in every frame before / after). ``"warp-clone"``: WARP's
+            tree to the byte (with ``waveshift=None`` or ``True`` and WARP's
+            options). Each spectrum's ``DECANTER`` card names the mode.
+        wavecal_check: default mode: also draw
+            ``reduction_log/decanter_wavecal_telluric.png``
+            (:func:`decanter.wavecal.telluric_check`).
         config / paramfile: pipeline configuration; ``paramfile`` is a WARP
             ``-p`` parameter file (:meth:`Config.from_parameter_file`).
         apertures: ``"solve"`` (decanter finds each frame's aperture, as WARP
@@ -997,19 +1002,18 @@ def reduce_to_warp_tree(
             ``False`` skips them (saves ~100 MB per frame).
         save: WARP's ``-s``: also every other intermediate (the 2-D stages,
             the per-order cut and rectified strips, ``SKY/5,6``) and the flat
-            and static mask in ``calibration_data/``. With ``mode="warp"`` the
+            and static mask in ``calibration_data/``. On the MLX backend the
             rectification then runs on the NumPy backend (the MLX backend's
             float32 subnormals off the extraction bands would show in the
             written strips).
         rawdata: copy the raw frames into ``rawdata_image/`` (WARP does).
         plots: draw WARP's figures (``*.png``/``*.pdf``,
             :mod:`decanter.warptree_plots`); ``False`` skips them.
-        waveshift: WARP's cross-frame shift (s10/s11). ``False`` (default):
-            off, every frame keeps its own ThAr wavelength scale (telluric
-            lines where the atmosphere put them). ``True``: on, as in WARP's
-            default and ``nominal_params.txt`` -- pass it (or ``None``) for a
-            tree byte-identical to such a WARP run. ``None``: follow
-            ``config`` / ``paramfile`` (``Measure Shift`` / ``Correct Shift``).
+        waveshift: WARP's cross-frame shift (s10/s11): ``True`` on, ``False``
+            off, ``None`` (default) the mode's choice -- off in ``"default"``
+            (the wavelength calibration replaces it), ``config`` / ``paramfile``
+            (``Measure Shift`` / ``Correct Shift``; WARP's default: on) in
+            ``"warp-clone"``.
         listname: file name for the listfile copy when ``listfile`` is a list
             of pairs (default ``<dest name>.txt``).
         log: progress callback (default: print, flushed). Pass
@@ -1031,11 +1035,10 @@ def reduce_to_warp_tree(
     if config is not None and paramfile is not None:
         raise ValueError("pass config or paramfile, not both")
     cfg = Config.from_parameter_file(Path(paramfile)) if paramfile else (config or Config())
-    from decanter.api import _with_waveshift
-    cfg = _with_waveshift(cfg, waveshift)
-    from decanter.api import check_supported, resolve_mode
-    check_supported(cfg)
+    from decanter.api import _with_waveshift, check_supported, resolve_mode
     mode = resolve_mode(mode)
+    cfg = _with_waveshift(cfg, waveshift, mode)
+    check_supported(cfg)
 
     if isinstance(listfile, (str, os.PathLike)):
         lines = read_warp_listfile(listfile)
@@ -1067,18 +1070,16 @@ def reduce_to_warp_tree(
     raw_dir = Path(raw_dir)
     lock_root = None if (isinstance(apertures, str) and apertures == "solve") else Path(apertures)
 
-    fast_backend = None
-    if mode == "warp":
-        from decanter.fast._backend import active_backend
-        fast_backend = active_backend()
-        from decanter.api import background_mode
-        if fast_backend == "mlx" and (save or background_mode(cfg) != "none"
-                                      or cfg.flag_extract2d):
-            # The MLX rectification differs from WARP in float32 subnormals of
-            # strip pixels outside every extraction band (docs/VECTORISED.md);
-            # -s writes those whole strips, and the background regions and
-            # 2-D strips may read them, so rectify on the CPU (exact).
-            fast_backend = "numpy"
+    from decanter.api import background_mode
+    from decanter.fast._backend import active_backend
+    fast_backend = active_backend()
+    if fast_backend == "mlx" and (save or background_mode(cfg) != "none"
+                                  or cfg.flag_extract2d):
+        # The MLX rectification differs from WARP in float32 subnormals of
+        # strip pixels outside every extraction band (docs/VECTORISED.md);
+        # -s writes those whole strips, and the background regions and
+        # 2-D strips may read them, so rectify on the CPU (exact).
+        fast_backend = "numpy"
 
     flat_name = Path(cal.flat).name
     apsc_name = Path(cal.apdb_apsc).name[2:]
@@ -1169,11 +1170,17 @@ def reduce_to_warp_tree(
                    else np.zeros(len(lines)))
         say(f"[decanter] waveshift: refid NO{wlog.refid + 1}, "
             f"{int(np.count_nonzero(applied))} frames shifted")
+        wavecal = None
+        if mode == "default":
+            # the night's OH + telluric wavelength calibration on the unshifted
+            # spectra; its per-order shifts go through WARP's s11 shift
+            say("[decanter] wavelength calibration (OH + telluric)")
+            wavecal, applied, wc_night = _tree_wavecal(ordered, cal, cfg)
 
         # --- s11-s13 + 1-D products per frame ---------------------------------
         stamp = time.strftime("# %a %H:%M:%S %d-%b-%Y", time.gmtime())
         cuts = tuple(cfg.cutrange_list)
-        shifted = len(lines) > 1 and cfg.flag_wscorrect
+        shifted = (len(lines) > 1 and cfg.flag_wscorrect) or wavecal is not None
         n = len(lines)
         # what <OBJ>_sum is made of: every frame's VAC (2..28 frames, scombine)
         # or frame 1's six products (scopy); handed over in memory
@@ -1182,7 +1189,7 @@ def reduce_to_warp_tree(
         # spectra; without the intermediates they go to a scratch directory
         bg_plot_dir = (dest / ".decanter_bgcw" if cfg.flag_skysub and plots
                        and not (intermediates or save) else None)
-        wjobs = [dict(part=p, shift=float(applied[k]), cal=cal, cfg=cfg, ctx=ctx, dest=str(dest),
+        wjobs = [dict(part=p, shift=applied[k] if wavecal is not None else float(applied[k]), cal=cal, cfg=cfg, ctx=ctx, dest=str(dest),
                       stamp=stamp, orders=orders, locked=lock_root is not None, mode=mode,
                       ncombine=shifted, intermediates=intermediates, save=save,
                       bg_plot_dir=None if bg_plot_dir is None else str(bg_plot_dir),
@@ -1195,7 +1202,9 @@ def reduce_to_warp_tree(
         ap_high = np.array([w[1] for w in written])
         reds = [w[2] for w in written]
         frames_out = [WarpTreeFrame(index=p.index, objname=p.objname, obj_raw=ln.obj,
-                                    sky_raw=ln.sky, shift=float(applied[k]))
+                                    sky_raw=ln.sky, shift=(float(np.mean(list(applied[k].values())))
+                                                           if wavecal is not None
+                                                           else float(applied[k])))
                       for k, (ln, p) in enumerate(zip(lines, ordered, strict=True))]
         say(f"[decanter] wrote {len(frames_out)} frame directories")
 
@@ -1240,6 +1249,8 @@ def reduce_to_warp_tree(
             say(f"[decanter] aperture_log: {window_note}")
         _write_logs(rl, dest, ordered, orders, cfg, ctx, cal, ap_low, ap_high, wlog, lines,
                     lock_root is not None)
+        if wavecal is not None:
+            _write_wavecal_log(rl, wavecal, wc_night, applied, ordered, plot=wavecal_check)
         for fut in night:
             fut.result()
         if bg_plot_dir is not None:
@@ -1254,7 +1265,7 @@ def reduce_to_warp_tree(
         comp_header=_afits.getheader(cal.comp), flat_header=_afits.getheader(cal.flat),
         cfg=cfg))
     prov = dict(decanter=_version(), mode=mode,
-                implementation="vectorised" if mode == "warp" else "reference",
+                implementation="vectorised",
                 fast_backend=_backend_label(fast_backend),
                 centersearch_minpack=(warp_minpack_label() if lock_root is None
                                       and not cfg.flag_manual_aperture else None),
@@ -1282,6 +1293,47 @@ def reduce_to_warp_tree(
                     elapsed=time.time() - t_start, reductions=reds)
 
 
+def _write_wavecal_log(rl: Path, sol, night, shifts: list, parts: list, *, plot: bool) -> None:
+    """The default mode's ``reduction_log/decanter_wavecal.json`` (per frame: the
+    telluric (star) and OH (sky) zero points with their errors, km/s, and the s11
+    shift applied per order) and, with ``plot``, ``decanter_wavecal_telluric.png``."""
+    import json
+
+    def arr(a):
+        return None if a is None else [None if not np.isfinite(v) else float(v)
+                                       for v in np.asarray(a, float)]
+    rec = dict(method=sol.method, mode=sol.mode,
+               frames=[f"{p.objname}_NO{p.index}" for p in parts],
+               z_star_kms=arr(sol.z_star), z_star_err_kms=arr(sol.z_star_err),
+               z_sky_kms=arr(sol.z_sky), z_sky_err_kms=arr(sol.z_sky_err),
+               s11_shift_per_order=[{str(m): v for m, v in sh.items()} for sh in shifts])
+    if plot:
+        from decanter.wavecal.plots import telluric_check
+        try:
+            rec["telluric_check"] = telluric_check(night, sol, rl / "decanter_wavecal_telluric.png")
+        except RuntimeError as e:          # no usable H2O line (e.g. a dry night in WIDE)
+            rec["telluric_check"] = dict(error=str(e))
+    (rl / "decanter_wavecal.json").write_text(json.dumps(rec, indent=1))
+
+
+def _tree_wavecal(parts: list, cal: Calibration, cfg: Config):
+    """The default mode's wavelength calibration of a tree's frames: the
+    solution and, per frame, ``{order: s11 shift}`` (:func:`decanter.api._wavecal_shifts`
+    on the frames' unshifted s11-s13 tail)."""
+    from decanter._reduction import Intermediates
+    from decanter.api import _finalize_wavelength, _wavecal_shifts
+
+    reds = []
+    for p in parts:
+        it = Intermediates()
+        it.spectra_1d, it.sky_1d, it.strip_wcs = p.spectra_1d, p.sky_1d, p.strip_wcs
+        r = _finalize_wavelength(p.spectra_1d, p.sky_1d, p.strip_wcs, p.objname, None, None,
+                                 cal, cfg, it, shift_wave=0.0, save_intermediates=False)
+        r.obj_header, r.sky_header = p.obj_header, p.sky_header
+        reds.append(r)
+    return _wavecal_shifts(reds, cal)       # (solution, per-frame shifts, night)
+
+
 def _spectrum(data, ua):
     from decanter.wavelength.iraf_onedspec import Spectrum1D
     return Spectrum1D(np.asarray(data, dtype=np.float32), ua)
@@ -1304,7 +1356,7 @@ def _write_frame(job: dict):
     import warnings
 
     from decanter._reduction import Intermediates, Reduction
-    from decanter.api import _finalize_wavelength, background_mode
+    from decanter.api import _finalize_wavelength, _shift_for, background_mode
     from decanter.io.fsr import load as load_fsr
     from decanter.warptree_chain import (ua_apall, ua_cut, ua_dispcor, ua_fsr, ua_refspec,
                                          ua_scopy_copy, ua_shift, ua_trans, ua_truncate)
@@ -1334,7 +1386,7 @@ def _write_frame(job: dict):
              for m in p.spectra_1d_none}
     r = _finalize_wavelength(p.spectra_1d, p.sky_1d, p.strip_wcs, name, None, None,
                              cal, cfg, inter, shift_wave=job["shift"], save_intermediates=True,
-                             fast=(mode == "warp"), bg_1d=bg_1d,
+                             bg_1d=bg_1d,
                              twod={"strip": p.strips_2d, "resample": p.strips_2d_resample})
     refs = {m: _read_ref_aperture(cal.ref_trans_apdbs[m] if job["locked"]
                                   else Path(p.aperture_refs[m]), m) for m in orders}
@@ -1384,7 +1436,8 @@ def _write_frame(job: dict):
         ext_ua, _, _ = ua_apall(tr_ua, nrows, apn, background=bgm)
         c_ua = ua_truncate(ext_ua, nrows)
         n_c = int(np.asarray(inter.spectra_trunc[m]).size)
-        cs_ua = ua_shift(c_ua, n_c, job["shift"]) if ncombine else ua_scopy_copy(c_ua, n_c)
+        cs_ua = (ua_shift(c_ua, n_c, _shift_for(job["shift"], m)) if ncombine
+                 else ua_scopy_copy(c_ua, n_c))
         cs_ua = ua_refspec(cs_ua, comp_id)
         if write_inter:
             write_iraf_fits(base_o / "1-OBJ-1DSPEC_extract" / f"{name}_NO{i}_m{m}.{m:04d}.fits",
@@ -1467,7 +1520,7 @@ def _write_frame(job: dict):
     # vectorised mode (bit for bit the same as one at a time)
     keys = list(obj_vac)
     derived = spectrum_products_many([obj_vac[k] for k in keys], [k[1] for k in keys],
-                                     batched=(mode == "warp"))
+                                     batched=True)
     for (cut, m), dprods in zip(keys, derived, strict=True):
         vac = obj_vac[(cut, m)]
         prods = {"VAC": vac}
@@ -1520,7 +1573,8 @@ def _write_frame(job: dict):
 
     light = Reduction(obj_name=name, obj_path=None, sky_path=None, obj=r.obj, sky=r.sky,
                       obj_header=p.obj_header, sky_header=p.sky_header,
-                      apertures=dict(p.apertures), shift_wave=job["shift"])
+                      apertures=dict(p.apertures),
+                      shift_wave=0.0 if isinstance(job["shift"], dict) else job["shift"])
     return lows, highs, light, sum_in
 
 
@@ -1532,6 +1586,7 @@ def _write_frame_twod(job: dict, fdir: Path, name: str, i: int, fm: str, m: int,
     (``-s``), their truncation (``-s``), shift (``3-OBJ-2DSPEC_shift``) and
     ``twodspec/{VAC,AIR}``; the 2-D header chain is
     :mod:`decanter.warptree_chain` (``ua_strip`` ... ``ua_dispcor_2d``)."""
+    from decanter.api import _shift_for
     from decanter.warptree_chain import (
         ua_copy_2d,
         ua_dispcor_2d,
@@ -1563,7 +1618,7 @@ def _write_frame_twod(job: dict, fdir: Path, name: str, i: int, fm: str, m: int,
         cut = inter.twod_trunc[key]
         nl, n_c = cut.shape
         cut_ua = ua_truncate_2d(s_ua, nrows, nl)
-        cuts_ua = (ua_shift_2d(cut_ua, n_c, job["shift"], nl) if ncombine
+        cuts_ua = (ua_shift_2d(cut_ua, n_c, _shift_for(job["shift"], m), nl) if ncombine
                    else ua_copy_2d(cut_ua, n_c, nl))
         cuts_ua = ua_refspec(cuts_ua, comp_id)
         if save:
@@ -1655,7 +1710,7 @@ def _sum_job(job: dict):
     warnings.filterwarnings("ignore")
     dest, rep, cut, m = Path(job["dest"]), job["rep"], job["cut"], job["m"]
     frames = job["frames"]                  # [(dirname, objname)] in frame order
-    batched = job.get("mode", "warp") == "warp"
+    batched = True
     prov = f"decanter {_version()}"
     c = f"{cut:.2f}"
     n = len(frames)
@@ -1704,7 +1759,7 @@ def _norm_comb_job(job: dict) -> None:
 
 
 def _write_sums(pool: _Pool, dest: Path, rep: str, frames: list, orders, cuts,
-                sum_inputs: list[dict], *, mode: str = "warp") -> dict:
+                sum_inputs: list[dict], *, mode: str = "default") -> dict:
     """``<OBJ>_sum`` (Warp_sci.py:735-766, 870-880), ``SNR_dat`` and the
     ``*_norm_comb`` spectra, from the frames' spectra (``sum_inputs``: per
     frame, what :func:`_write_frame` handed over).  Returns the SNR values

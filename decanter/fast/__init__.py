@@ -1,9 +1,8 @@
-"""decanter's default WARP-clone implementation: vectorised and calibration-cached.
+"""decanter's WARP pipeline: vectorised and calibration-cached.
 
-``decanter.reduce(...)`` (``mode="warp"``, the default) and ``reduce_many`` / ``reduce_to_warp_tree`` run the WARP-clone
-recipe through this package -- same stages, same apertures, same cross-frame
-shift, same dispcor grid and FSR cuts as the scalar reference port
-(``mode="warp-reference"``) -- with the same arithmetic, restructured:
+``decanter.reduce`` / ``reduce_many`` / ``reduce_to_warp_tree`` (both modes)
+run WARP's recipe through this package -- WARP's stages, apertures, dispcor
+grid and FSR cuts -- with WARP's arithmetic, restructured:
 
 * s02 cosmic-ray mask (:func:`cr_mask`): sorting-network median filters and
   precomputed tile maps;
@@ -16,9 +15,9 @@ shift, same dispcor grid and FSR cuts as the scalar reference port
 * s12 dispcor map (:func:`decanter.fast.wavelength.dispcor_edges_fast`).
 
 Everything else (s01, s03-s05, s07 center search, s10, s11, s13) is the
-reference port's own code. The results are bit-identical to
-``mode="warp-reference"`` (``docs/VECTORISED.md``; on the MLX backend up to
-float32 subnormals in s06 strip pixels the extraction never reads).
+stage-by-stage port's own code. The results are bit-identical to WARP
+(``docs/VECTORISED.md``; on the MLX backend up to float32 subnormals in s06
+strip pixels the extraction never reads).
 
 Backends: s06 runs on the Apple GPU through MLX when ``mlx`` imports and has a
 GPU, else in NumPy (IRAF's float32 arithmetic with exactly rounded fused

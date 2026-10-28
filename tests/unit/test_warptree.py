@@ -333,16 +333,16 @@ def test_provenance_records_implementation_and_backend(tmp_path):
                                      tmp_path / "t", config=cfg,            # default mode
                                      intermediates=False, log=lambda s: None)
     prov = json.loads((tmp_path / "t" / "reduction_log" / "decanter_provenance.json").read_text())
-    assert prov["mode"] == "warp" and prov["implementation"] == "vectorised"
+    assert prov["mode"] == "default" and prov["implementation"] == "vectorised"
     assert prov["fast_backend"] == "numpy"
-    decanter.reduce_to_warp_tree([("WINA00053571", "WINA00053572")], raw, cal,
-                                 tmp_path / "r", mode="warp-reference", config=cfg,
-                                 intermediates=False, log=lambda s: None)
+    with backend("numpy"):
+        decanter.reduce_to_warp_tree([("WINA00053571", "WINA00053572")], raw, cal,
+                                     tmp_path / "r", mode="warp-clone", config=cfg,
+                                     intermediates=False, log=lambda s: None)
     prov = json.loads((tmp_path / "r" / "reduction_log" / "decanter_provenance.json").read_text())
-    assert prov["mode"] == "warp-reference" and prov["implementation"] == "reference"
-    assert prov["fast_backend"] is None
+    assert prov["mode"] == "warp-clone" and prov["implementation"] == "vectorised"
     from astropy.io import fits
-    for t, m in (("t", "warp"), ("r", "warp-reference")):
+    for t, m in (("t", "default"), ("r", "warp-clone")):
         f = next((tmp_path / t).glob("*_NO1/onedspec/VAC_flux/fsr1.05/*_m163_fsr1.05_VAC.fits"))
         assert fits.getheader(f)["DECANTER"].endswith(f"mode={m}")
 
@@ -362,7 +362,7 @@ def _card(path, key: str) -> str | None:
 
 def test_tree_stamps_are_irafs_at_a_single_digit_hour(tmp_path, monkeypatch):
     """FIXPIX's run time and the databases IRAF writes carry IRAF's cnvdate / cnvtime of
-    IRAF's clock, in the vectorised and the reference implementation.  At 2026-10-22
+    IRAF's clock, in both modes.  At 2026-10-22
     01:03:47 PDT IRAF's clock reads 00:03:47 (standard time): FIXPIX 'Oct 22  0:03'
     (decanter f49c5d4 wrote 'Oct 22 01:03'), databases '# Thu 00:03:47 22-Oct-2026';
     WARP's own aperture.py stamp stays UTC."""
@@ -386,13 +386,11 @@ def test_tree_stamps_are_irafs_at_a_single_digit_hour(tmp_path, monkeypatch):
     cfg = Config(selected_orders=(163,), reduce_full_data=False)
     try:
         with backend("numpy"):
-            decanter.reduce_to_warp_tree([("WINA00053571", "WINA00053572")], raw, cal,
-                                         tmp_path / "t", config=cfg, intermediates=True,
-                                         rawdata=False, plots=False, log=lambda s: None)
-        decanter.reduce_to_warp_tree([("WINA00053571", "WINA00053572")], raw, cal,
-                                     tmp_path / "r", mode="warp-reference", config=cfg,
-                                     intermediates=True, rawdata=False, plots=False,
-                                     log=lambda s: None)
+            for t, mode in (("t", "default"), ("r", "warp-clone")):
+                decanter.reduce_to_warp_tree([("WINA00053571", "WINA00053572")], raw, cal,
+                                             tmp_path / t, mode=mode, config=cfg,
+                                             intermediates=True, rawdata=False, plots=False,
+                                             log=lambda s: None)
     finally:
         if old_tz is None:
             os.environ.pop("TZ", None)
@@ -548,7 +546,7 @@ def test_reduce_to_warp_tree_copies_the_strays_like_warp(tmp_path):
     with backend("numpy"):
         decanter.reduce_to_warp_tree([("WINA00053571", "WINA00053572")], raw, cal,
                                      tmp_path / "t", config=cfg, intermediates=False,
-                                     rawdata=False, plots=False, log=lambda s: None)
+                                     rawdata=False, plots=False, log=lambda s: None, mode="warp-clone")
     root = {p.name for p in (tmp_path / "t").iterdir()}
     assert {"sys", "extra"} <= root and ".hidden" not in root
     assert (tmp_path / "t" / "sys").read_bytes() == b""
@@ -559,4 +557,4 @@ def test_reduce_to_warp_tree_copies_the_strays_like_warp(tmp_path):
     with pytest.raises(ValueError, match="reduction_log"):
         decanter.reduce_to_warp_tree([("WINA00053571", "WINA00053572")], raw, cal,
                                      tmp_path / "u", config=cfg, intermediates=False,
-                                     rawdata=False, plots=False, log=lambda s: None)
+                                     rawdata=False, plots=False, log=lambda s: None, mode="warp-clone")

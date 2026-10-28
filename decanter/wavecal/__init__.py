@@ -17,4 +17,7 @@ validation. Needs the optional ``wavecal`` extra (JAX).
 A WARP reduction directory works too: ``wc.anchor(wc.load_warp_night(root))``.
 """
 from decanter.wavecal.model import *  # noqa: F403
-from decanter.wavecal.model import __all__  # noqa: F401
+from decanter.wavecal.model import __all__ as _model_all
+from decanter.wavecal.plots import pick_line, telluric_check
+
+__all__ = [*_model_all, "pick_line", "telluric_check"]

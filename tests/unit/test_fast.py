@@ -1,11 +1,9 @@
-"""The default WARP clone (``decanter.reduce(..., mode="warp")``, the
-vectorised implementation in :mod:`decanter.fast`).
+"""The vectorised WARP pipeline (:mod:`decanter.fast`, every mode).
 
-Kernel tests run on synthetic data; the end-to-end checks against the scalar
-reference port (``mode="warp-reference"``) use the TOI2109 WARP ``-s``
-reference reduction and skip without it. The default is bit-identical to the
-reference port (``docs/VECTORISED.md``); the MLX backend's identity is an
-observation about the Metal compiler, tested here too.
+Kernel tests run on synthetic data, against the scalar reference kernels;
+the end-to-end checks use the TOI2109 WARP ``-s`` reference reduction and skip
+without it. The MLX backend's identity is an observation about the Metal
+compiler, tested here too.
 """
 from __future__ import annotations
 
@@ -62,25 +60,27 @@ def test_reduce_rejects_unknown_mode():
 
 def test_mode_names():
     from decanter.api import implementation, resolve_mode
-    assert resolve_mode("warp") == "warp"
-    assert resolve_mode("warp-reference") == "warp-reference"
-    for bad in ("reference", "fast"):
-        with pytest.raises(ValueError, match="not implemented"):
+    assert resolve_mode("default") == "default"
+    assert resolve_mode("warp-clone") == "warp-clone"
+    for bad in ("warp", "warp-reference", "reference", "fast"):
+        with pytest.raises(ValueError, match="not a decanter mode"):
             resolve_mode(bad)
+    with pytest.raises(ValueError, match="'warp-clone'"):
+        resolve_mode("warp")
     with _backend.backend("numpy"):
-        assert implementation("warp") == {"mode": "warp", "implementation": "vectorised",
-                                          "backend": "numpy"}
-    assert implementation("warp-reference")["implementation"] == "reference"
+        assert implementation("warp-clone") == {"mode": "warp-clone",
+                                                "implementation": "vectorised",
+                                                "backend": "numpy"}
 
 
 def test_default_mode_is_vectorised(monkeypatch):
-    """reduce() with no mode runs decanter.fast's rectification, warp-reference does not."""
+    """reduce() with no mode runs the default mode (decanter.fast's rectification)."""
     import inspect
 
     from decanter import api
-    assert inspect.signature(api.reduce).parameters["mode"].default == "warp"
-    assert inspect.signature(api.reduce_many).parameters["mode"].default == "warp"
-    assert inspect.signature(decanter.reduce_to_warp_tree).parameters["mode"].default == "warp"
+    assert inspect.signature(api.reduce).parameters["mode"].default == "default"
+    assert inspect.signature(api.reduce_many).parameters["mode"].default == "default"
+    assert inspect.signature(decanter.reduce_to_warp_tree).parameters["mode"].default == "default"
 
     class _Called(Exception):
         pass
@@ -186,31 +186,6 @@ def _pair():
 
 
 @needs_ref
-@pytest.mark.parametrize("path", ["locked", "free"])
-@pytest.mark.parametrize("backend", ["numpy", pytest.param("mlx", marks=needs_mlx)])
-def test_reduce_fast_matches_warp(path, backend):
-    calib = decanter.Calibration.from_dir(WARP_REFERENCE_PATH)
-    if path == "free":
-        calib = dataclasses.replace(calib, trans_apdbs=None)
-    cfg = Config(reduce_full_data=False, selected_orders=(163, 171))
-    obj, sky = _pair()
-    rw = decanter.reduce(obj, calib, sky=sky, config=cfg, shift_wave=0.013,
-                         mode="warp-reference")
-    with _backend.backend(backend):
-        rf = decanter.reduce(obj, calib, sky=sky, config=cfg, shift_wave=0.013)   # default
-    assert set(rf.obj) == set(rw.obj) and set(rf.sky) == set(rw.sky)
-    for kind in ("obj", "sky"):
-        A, B = getattr(rw, kind), getattr(rf, kind)
-        for key in A:
-            assert A[key].header_wcs == B[key].header_wcs
-            assert (A[key].crval1, A[key].cdelt1) == (B[key].crval1, B[key].cdelt1)
-            assert np.array_equal(_bits(B[key].flux), _bits(A[key].flux)), (kind, key)
-    assert rf.apertures == rw.apertures
-    # the default always keeps the 1-D extractions (reduce_many / warp tree use them)
-    assert set(rf.intermediates.spectra_1d) == {163, 171}
-
-
-@needs_ref
 def test_fast_rectify_band_and_full():
     from decanter.calib.aperture import ApertureSet
     from decanter.io import fits as _fits
@@ -255,18 +230,18 @@ def test_fast_cr_mask_bit_identical():
 
 
 @needs_ref
-def test_warp_tree_default_mode(tmp_path):
+def test_warp_tree_warp_clone_mode(tmp_path):
     obj, sky = _pair()
     cfg = Config(reduce_full_data=False, selected_orders=(163,))
     tree = decanter.reduce_to_warp_tree([(obj.stem, sky.stem)], obj.parent,
                                         WARP_REFERENCE_PATH, tmp_path / "t",
-                                        config=cfg, log=lambda s: None)
+                                        mode="warp-clone", config=cfg, log=lambda s: None)
     from astropy.io import fits
     for cut in tree.cuts:
         p = tree.vac_flux(1, 163, cut)
-        assert fits.getheader(p)["DECANTER"].endswith("mode=warp")
+        assert fits.getheader(p)["DECANTER"].endswith("mode=warp-clone")
         assert np.isfinite(fits.getdata(p)).all()
-    assert tree.mode == "warp"
+    assert tree.mode == "warp-clone"
 
 
 @needs_ref

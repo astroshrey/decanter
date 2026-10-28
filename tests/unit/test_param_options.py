@@ -131,4 +131,4 @@ def test_manual_flag_needs_window():
     import decanter
     with pytest.raises(ValueError, match="aperture"):
         decanter.reduce(np.zeros((4, 4), np.float32), None,
-                        config=Config(flag_manual_aperture=True))
+                        config=Config(flag_manual_aperture=True), mode="warp-clone")

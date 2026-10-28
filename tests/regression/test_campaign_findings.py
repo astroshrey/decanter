@@ -37,7 +37,7 @@ def _have(tn, night, cset):
 
 
 @pytest.mark.regression
-@pytest.mark.parametrize("mode", ["warp", "warp-reference"])
+@pytest.mark.parametrize("mode", ["warp-clone"])
 @pytest.mark.parametrize("tn,no,prefix,m,night,cset", CASES)
 def test_frame_order_matches_archived_warp(tn, no, prefix, m, night, cset, mode):
     if not _have(tn, night, cset):

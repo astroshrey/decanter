@@ -48,9 +48,9 @@ This module reproduces, operation for operation as compiled on this Mac
   the sky (apextract.x:1647-1712).
 
 :func:`apsum_background` / :func:`strip_extract` are the scalar reference
-(``mode="warp-reference"``); :func:`apsum_background_fast` /
+(the tests' oracle); :func:`apsum_background_fast` /
 :func:`strip_extract_fast` evaluate every line at once with the same
-arithmetic (``mode="warp"``).  WARP always writes order 1, so the sky of
+arithmetic (what the pipeline runs).  WARP always writes order 1, so the sky of
 every mode is one value per line; other ICFIT settings raise
 :class:`NotImplementedError` in the vectorised path and are followed
 literally (order 1 only) in the scalar one.
@@ -698,7 +698,7 @@ def _strip_line(row: NDArray[np.float32], nc: int, low: np.float32, high: np.flo
 
 
 # ---------------------------------------------------------------------------
-# Vectorised (mode="warp")
+# Vectorised (every mode)
 # ---------------------------------------------------------------------------
 
 def _lin_coeffs(rows: NDArray[np.float32], n: NDArray[np.int64], width: int) -> NDArray[np.float32]:
