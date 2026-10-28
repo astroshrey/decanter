@@ -965,6 +965,7 @@ def reduce_to_warp_tree(
     save: bool = False,
     rawdata: bool = True,
     plots: bool = True,
+    waveshift: bool | None = False,
 ) -> WarpTree:
     """Reduce every frame of a listfile and write WARP's directory layout.
 
@@ -1003,6 +1004,12 @@ def reduce_to_warp_tree(
         rawdata: copy the raw frames into ``rawdata_image/`` (WARP does).
         plots: draw WARP's figures (``*.png``/``*.pdf``,
             :mod:`decanter.warptree_plots`); ``False`` skips them.
+        waveshift: WARP's cross-frame shift (s10/s11). ``False`` (default):
+            off, every frame keeps its own ThAr wavelength scale (telluric
+            lines where the atmosphere put them). ``True``: on, as in WARP's
+            default and ``nominal_params.txt`` -- pass it (or ``None``) for a
+            tree byte-identical to such a WARP run. ``None``: follow
+            ``config`` / ``paramfile`` (``Measure Shift`` / ``Correct Shift``).
         listname: file name for the listfile copy when ``listfile`` is a list
             of pairs (default ``<dest name>.txt``).
         log: progress callback (default: print, flushed). Pass
@@ -1024,6 +1031,8 @@ def reduce_to_warp_tree(
     if config is not None and paramfile is not None:
         raise ValueError("pass config or paramfile, not both")
     cfg = Config.from_parameter_file(Path(paramfile)) if paramfile else (config or Config())
+    from decanter.api import _with_waveshift
+    cfg = _with_waveshift(cfg, waveshift)
     from decanter.api import check_supported, resolve_mode
     check_supported(cfg)
     mode = resolve_mode(mode)

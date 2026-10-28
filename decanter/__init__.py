@@ -31,7 +31,7 @@ User-facing API:
 See ``docs/BITEXACT.md`` for what is verified against WARP.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 from decanter._reduction import Intermediates, OrderSpectrum, Reduction
 from decanter.api import TransitSeries, combine, reduce, reduce_many

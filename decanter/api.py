@@ -14,6 +14,8 @@ work uses :func:`reduce` in a loop and keeps each frame independent.
 """
 from __future__ import annotations
 
+import dataclasses
+
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -995,6 +997,15 @@ class TransitSeries:
     refid: int
 
 
+def _with_waveshift(cfg: Config, waveshift: bool | None) -> Config:
+    """``cfg`` with WARP's measure / correct shift flags set to ``waveshift``
+    (``None`` leaves them as configured)."""
+    if waveshift is None:
+        return cfg
+    return dataclasses.replace(cfg, flag_wsmeasure=bool(waveshift),
+                               flag_wscorrect=bool(waveshift))
+
+
 def reduce_many(
     pairs: list[tuple],
     calib: Calibration,
@@ -1006,22 +1017,29 @@ def reduce_many(
     subtract_background: bool = False,
     align: bool = True,
     mode: str = "warp",
+    waveshift: bool | None = False,
 ) -> TransitSeries:
-    """Reduce a list of ``(obj, sky)`` frame pairs and align them in wavelength.
+    """Reduce a list of ``(obj, sky)`` frame pairs, optionally aligning them in wavelength.
 
-    Runs :func:`reduce` on each pair once (the expensive part), then measures a
-    per-frame cross-frame wavelength shift by cross-correlating the extracted
-    1D spectra against a reference frame (WARP's ``ccwaveshift`` / s10), and
-    re-runs only the cheap wavelength-finalize tail with each frame's shift so
-    every frame lands on the reference frame's grid.
+    Runs :func:`reduce` on each pair once (the expensive part). With
+    ``waveshift=True`` it then measures a per-frame cross-frame wavelength shift
+    by cross-correlating the extracted 1D spectra against a reference frame
+    (WARP's ``ccwaveshift`` / s10) and re-runs only the cheap
+    wavelength-finalize tail with each frame's shift, so every frame lands on
+    the reference frame's grid.
 
     Args:
         pairs: ``[(obj, sky), ...]`` — paths or arrays, as for :func:`reduce`.
         refid: reference-frame index; default = WARP's choice (the frame with
             the largest sum of per-order median counts, frame 0 for <= 2 frames).
         extract: ``"box"`` or ``"optimal"`` (applied to every frame).
-        align: if False, skip shift measurement (shifts all 0) — useful to
-            get the per-frame reductions without cross-frame alignment.
+        align: if False, skip shift measurement (shifts all 0) whatever
+            ``waveshift`` and ``config`` say.
+        waveshift: WARP's cross-frame shift (s10/s11). ``False`` (default):
+            off, every frame keeps its own ThAr wavelength scale, so the
+            telluric lines stay where the atmosphere put them. ``True``:
+            measure and apply it, as WARP does by default. ``None``: follow
+            ``config`` (``flag_wsmeasure`` / ``flag_wscorrect``).
         mode: ``"warp"`` (default) or ``"warp-reference"`` — see :func:`reduce`. With ``"warp"`` the
             per-frame reductions carry only the 1-D intermediates (no 2-D
             frames or strips) and the calibration-only work is cached across
@@ -1032,7 +1050,7 @@ def reduce_many(
     """
     mode = resolve_mode(mode)
     fast = mode == "warp"
-    cfg = config or Config()
+    cfg = _with_waveshift(config or Config(), waveshift)
     base = [
         reduce(o, calib, sky=s, config=cfg, extract=extract,
                check_calib=check_calib, subtract_background=subtract_background,

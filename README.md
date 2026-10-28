@@ -29,19 +29,25 @@ spec = r.obj[(1.30, 163)]        # OrderSpectrum, keyed by (FSR cut, order)
 spec.wavelength, spec.flux       # vacuum-Å grid + flux (counts)
 ```
 
-A time series, with WARP's cross-frame wavelength shift:
+A time series:
 
 ```python
 series = decanter.reduce_many(frame_pairs, calib)
 ```
 
+WARP's cross-frame wavelength shift (s10/s11, which moves every frame onto a
+reference frame's grid) is **off by default**, so each frame keeps its own
+ThAr scale and the telluric lines stay in their true frame. Pass
+`waveshift=True` to apply it as WARP does.
+
 A whole night written exactly as WARP writes it (`reductions/<testname>/`), so
-anything that reads WARP output works unchanged:
+anything that reads WARP output works unchanged. Add `waveshift=True` (WARP's
+default) for a tree byte-identical to WARP's:
 
 ```python
 decanter.reduce_to_warp_tree("TOI836.txt", "science_data/2025_02_15",
                              calib_dir, "reductions/TOI836",
-                             paramfile="nominal_params.txt")
+                             paramfile="nominal_params.txt", waveshift=True)
 ```
 
 Compare two such trees file by file with
