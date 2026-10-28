@@ -35,14 +35,13 @@ def test_truncate_returns_iraf_wcs_keys():
     # NAXIS matches WARP's m163 output exactly.
     assert out.size == 2005
 
-    # IRAF semantics: CRVAL preserved.
-    assert wcs["crval1"] == crval1
+    # The returned WCS is the REAL grid the data were resampled onto
+    # (w0 + (x - 1) * dw, CRPIX1 = 1). WARP's header encodes it differently
+    # (input CRVAL1 at physical pixel 1, negative CRPIX1): see
+    # wavelength/iraf_wcs.py:scopy_wcs and test_warptree.py.
+    assert wcs["crpix1"] == 1.0
 
-    # CRPIX < 0 for orders that start mid-FSR (the FSR window doesn't include
-    # the input's CRVAL pixel).
-    assert wcs["crpix1"] < 0
-
-    # CDELT slightly larger than input CDELT (LTM1_1 > 1 because the
+    # Step slightly larger than the input CDELT (LTM1_1 > 1 because the
     # fractional-pixel span exceeds the integer-pixel count by ~0.04%).
     assert wcs["cdelt1"] > cdelt1
     assert abs(wcs["cdelt1"] - 0.0344759710) < 1e-6

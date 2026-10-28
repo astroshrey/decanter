@@ -1,22 +1,22 @@
-"""Stage 6 — 2D→1D transform & cut per echelle order.
+"""Stage 6 -- cut & transform each echelle order (bit-exact WARP clone).
 
 WARP equivalent: ``warp/cutransform.py:cutransform`` (line 94).
 For each order ``m`` in the aperture set:
 
-  1. Cut the input frame to columns ``[xmin, xmax]`` where
-     ``xmin = trace_x[0] - 100`` and ``xmax = trace_x[-1] + 100``
+  1. ``imcopy`` the frame's columns ``[xmin, xmax]`` where
+     ``xmin = int(trace_x[0] - 100)`` and ``xmax = int(trace_x[-1] + 100)``
      (clipped to ``[1, 2048]``).
-  2. Apply the per-order ``fitcoords`` surface (``database/fc<ref>_<m>``)
-     to resample onto a uniform-wavelength y-grid with step ``dy`` =
-     comp file ``CDELT1``.
-  3. Write the rectified strip to ``{frame}_m{order}trans.fits`` with
-     wavelength-WCS keywords (``CRVAL2``, ``CDELT2``, etc.).
+  2. ``iraf.transform(cut, trans, fitnames=<aptrans>_<m>, flux="no",
+     dy=dy, interptype="spline3")`` with the per-order ``fitcoords``
+     surface ``database/fc<ref>_<m>``.
+  3. Write ``{frame}_m{order}trans.fits`` with the linear WCS
+     (``CRVAL2`` = the surface's minimum corner value, ``CDELT2`` = dy).
 
-Output suffix: ``_m###trans``. WARP uses IRAF
-``transform(..., interptype=spline3)``; we use
-``scipy.ndimage.map_coordinates(order=3)`` (cubic B-spline). The two
-differ slightly at high curvature; per-pixel parity is checked
-empirically — see ``EXECUTION_LOG.md`` parity entry for this stage.
+Output suffix: ``_m###trans``.  The transform is IRAF's own algorithm
+reproduced operation for operation (:mod:`decanter.rectify.iraf_transform`);
+it matches WARP's saved ``_m###trans.fits`` with 0 differing float32
+values (object and sky).  The image-independent part (inverse-mapping grid,
+line-buffer schedule) is computed once per surface and cached.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from astropy.io import fits as _astrofits
 from numpy.typing import NDArray
 
 from decanter.calib.aperture import ApertureSet
-from decanter.calib.transform import RectifiedStrip, load_fc_surface, rectify_order
+from decanter.calib.transform import RectifiedStrip, load_fc_surface, strip_from_plan
 from decanter.config import Config
 from decanter.io import fits as _fits
 from decanter.io import headers
@@ -47,6 +47,49 @@ def _sanitize_objname(raw: str) -> str:
     return name
 
 
+def _cut_limits(ap, array_length: int) -> tuple[int, int]:
+    # warp/cutransform.py:117-125
+    xmin = int(ap.trace_x[0] - _XMARGIN)
+    xmax = int(ap.trace_x[-1] + _XMARGIN)
+    return (1 if xmin < 1 else xmin), (array_length if xmax > array_length else xmax)
+
+
+def rectify_orders_multi(
+    images: Iterable[NDArray],
+    apset: ApertureSet,
+    *,
+    fc_dir: Path,
+    fc_refname: str,
+    dy: float,
+    orders: Iterable[int] | None = None,
+    flux: bool = False,
+) -> list[dict[int, RectifiedStrip]]:
+    """:func:`rectify_orders` for several frames sharing one calibration.
+
+    The frames (e.g. the object and its sky) are transformed with the same
+    per-order plans; the image-independent work (inverse coordinates,
+    B-spline weights) is shared between them.
+
+    IRAF equivalent: ``longslit.transform`` per frame and order
+    (``noao/twodspec/longslit/transform/t_transform.x``).
+    """
+    from decanter.rectify import iraf_transform as T
+
+    imgs = [np.asarray(im) for im in images]
+    fc_dir_p = Path(fc_dir)
+    requested = tuple(orders) if orders is not None else tuple(apset.echelle_orders)
+    plans = T.get_plans([fc_dir_p / f"fc{fc_refname}_{m}" for m in requested], dy)
+    out: list[dict[int, RectifiedStrip]] = [dict() for _ in imgs]
+    for m, plan in zip(requested, plans):
+        xmin, xmax = _cut_limits(apset.apertures[m], apset.array_length)
+        cuts = [np.ascontiguousarray(im[:, xmin - 1:xmax], dtype=np.float32) for im in imgs]
+        sched = T.schedule_for(plan, cuts[0].shape[0])
+        results = T.tr_transform_many(cuts, plan, sched, flux=flux)
+        for k, res in enumerate(results):
+            out[k][m] = strip_from_plan(res, plan, xmin, xmax)
+    return out
+
+
 def rectify_orders(
     data: NDArray,
     apset: ApertureSet,
@@ -55,31 +98,25 @@ def rectify_orders(
     fc_refname: str,
     dy: float,
     orders: Iterable[int] | None = None,
+    flux: bool = False,
 ) -> dict[int, RectifiedStrip]:
-    """Pure task function: rectify every echelle order of a 2D frame.
+    """Pure task function: cut and transform every echelle order of a frame.
 
     For each order in ``orders`` (defaults to ``apset.echelle_orders``),
     cuts ``data`` to ``[trace_x[0] - 100, trace_x[-1] + 100]`` and applies
-    the matching ``fc<refname>_<m>`` surface via :func:`rectify_order`.
+    IRAF ``transform`` with the matching ``fc<refname>_<m>`` surface.
+
+    IRAF equivalent: ``warp/cutransform.py:cutransform`` ->
+    ``images.imcopy`` + ``twodspec.longslit.transform``.  ``flux`` is
+    ``transform flux=`` (WARP's ``CUTRANSFORM flux``; ``t_transform.x:577-581``).
 
     Returns:
-        ``{order: RectifiedStrip}`` — one entry per requested order,
-        each carrying ``data``, ``xmin``, ``xmax``, ``lambda_min``,
-        ``dy``, ``units`` (from the surface).
+        ``{order: RectifiedStrip}`` -- one entry per requested order,
+        each carrying ``data`` (REAL), ``xmin``, ``xmax``, ``lambda_min``
+        (``CRVAL2``), ``lambda_max`` and ``dy`` (``CDELT2``).
     """
-    fc_dir_p = Path(fc_dir)
-    requested = tuple(orders) if orders is not None else tuple(apset.echelle_orders)
-    out: dict[int, RectifiedStrip] = {}
-    for m in requested:
-        ap = apset.apertures[m]
-        xmin = max(1, int(ap.trace_x[0] - _XMARGIN))
-        xmax = min(apset.array_length, int(ap.trace_x[-1] + _XMARGIN))
-        surface = load_fc_surface(fc_dir_p / f"fc{fc_refname}_{m}")
-        out[m] = rectify_order(
-            data, surface, xmin=xmin, xmax=xmax, dy=float(dy),
-            array_length=apset.array_length,
-        )
-    return out
+    return rectify_orders_multi([data], apset, fc_dir=fc_dir, fc_refname=fc_refname,
+                                dy=dy, orders=orders, flux=flux)[0]
 
 
 def _strip_header(base_header: _astrofits.Header, strip: RectifiedStrip,

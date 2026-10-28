@@ -237,3 +237,102 @@ def test_negative_diff_attributes_cr_to_sky_frame() -> None:
         slitposratio=100.0,
     )
     assert result.mask[80, 130] == 1, "negative-diff CR should still be flagged"
+
+
+# ---- WARP factor-map semantics (badpixmask.py:186-235) ------------------------
+#
+# Regression for the Qatar6 NO9/NO10 + HD207496 NO35 s02 mismatches: decanter's
+# factor map used 30 half-open bins [-30,-28) ... [28,30), float64 bincount
+# statistics and nanmax. WARP measures 28 bins (r_s, r_s+2] for r_s=-28..26
+# with float32 np.std, and takes Python's builtin max (a NaN in the first bin
+# makes the factor 1).
+
+from decanter.utils.cosmic_ray import (  # noqa: E402
+    _warp_window_factor,
+    warp_slit_bins,
+    warp_y_windows,
+)
+
+
+def test_warp_slit_bins_and_windows() -> None:
+    b = warp_slit_bins(-30, 30, 2)
+    assert len(b) == 28 and b[0] == (-28, -26) and b[-1] == (26, 28)
+    assert warp_y_windows(2048, 100) == [(100 * j, 100 * (j + 1)) for j in range(19)]
+    assert warp_y_windows(400, 100) == [(0, 100), (100, 200), (200, 300)]
+
+
+def _one_order_frame(noisy_slit: float | None, *, first_slit: float = -29.0, seed: int = 5):
+    """400x400 frame, one order (160) along y at x=200, integer slit coordinates
+    (so pixels sit exactly on WARP's bin edges), constant raws, unit-noise diff,
+    one column of huge diff noise at ``noisy_slit`` and a 600-ADU cosmic ray in
+    the object frame at (150, 210)."""
+    H = W = 400
+    rng = np.random.default_rng(seed)
+    x = np.arange(W)
+    slit = np.broadcast_to((x - 200).astype(np.float64), (H, W))
+    inside = (np.abs(slit) < 30) & (slit >= first_slit)
+    apmask = np.where(inside, 160, 0).astype(np.int32)
+    slitcoord = np.where(inside, slit, -10000.0)
+    raw1 = np.full((H, W), 1000.0, dtype=np.float32)
+    raw2 = np.full((H, W), 1000.0, dtype=np.float32)
+    diff = rng.normal(0.0, 1.0, (H, W)).astype(np.float32)
+    if noisy_slit is not None:
+        col = 200 + int(noisy_slit)
+        diff[:, col] = rng.normal(0.0, 2000.0, H).astype(np.float32)
+    raw1[150, 210] += 600.0
+    diff[150, 210] += 600.0
+    bp = np.zeros((H, W), dtype=np.int16)
+    return diff, raw1, raw2, apmask, slitcoord, bp
+
+
+def _detect(diff, raw1, raw2, apmask, slitcoord, bp):
+    return detect_cosmic_rays(
+        diff=diff, raw1=raw1, raw2=raw2, apmask=apmask, slitcoord=slitcoord,
+        static_bp=bp, ndr1=8, ndr2=8, abba=True, echelle_orders=(160,),
+        array_length=400)
+
+
+@pytest.mark.parametrize("noisy_slit,found", [
+    (-29.0, True),   # edge strip (-30, -28]: never measured by WARP
+    (-28.0, True),   # bin edge: -28 belongs to (-30, -28], not (-28, -26]
+    (29.0, True),    # edge strip (28, 30)
+    (28.0, False),   # in (26, 28]: measured -> factor ~ 50 -> the CR is missed
+    (-27.0, False),  # in (-28, -26]
+])
+def test_factor_map_uses_warp_slit_bins(noisy_slit: float, found: bool) -> None:
+    res = _detect(*_one_order_frame(noisy_slit))
+    assert bool(res.mask[150, 210]) is found
+
+
+def test_factor_nan_first_bin_gives_factor_one() -> None:
+    """Order without pixels in (-28, -26]: WARP's first std is NaN, so the
+    builtin ``max`` keeps NaN and ``max(1., nan)`` is 1 even though another
+    bin is very noisy; nanmax-based code missed this CR."""
+    res = _detect(*_one_order_frame(0.0, first_slit=-25.0))
+    assert res.mask[150, 210] == 1
+
+
+def test_window_factor_python_max_semantics() -> None:
+    sc = np.array([-27.0, -27.0, -25.0, -25.0, -23.0, -23.0])
+    n = np.full(sc.shape, 2.0, dtype=np.float32)
+    kw = dict(xlim1=-30, xlim2=30, bins=2, clipsigma=5., iteration=3)
+    # First bin all zero: std 0 -> |v| < 0 keeps nothing -> NaN -> factor 1.
+    d = np.array([0, 0, 50, -50, 0, 0], dtype=np.float32)
+    assert _warp_window_factor(sc, d, n, **kw) == 1.0
+    # NaN in a later bin is skipped by max: factor = std(second bin) / 2.
+    d = np.array([1, -1, 50, -50, 0, 0], dtype=np.float32)
+    f = _warp_window_factor(sc, d, n, **kw)
+    assert f == np.float32(50.0) / np.float32(2.0) and isinstance(f, np.float32)
+
+
+def test_noise_image_is_float32_left_to_right() -> None:
+    from decanter.utils.cosmic_ray import warp_noise_image
+    rng = np.random.default_rng(3)
+    r1 = rng.uniform(0, 5e4, (30, 30)).astype(">f4")
+    r2 = rng.uniform(0, 5e4, (30, 30)).astype(">f4")
+    got = warp_noise_image(r1, r2, 8, 16)
+    import scipy.ndimage
+    from decanter.utils.cosmic_ray import _make_slant_footprint
+    mf = scipy.ndimage.median_filter(np.absolute(r1 + r2), footprint=_make_slant_footprint())
+    want = (mf * 2.27 + 8. ** 2. + 6. ** 2.) ** 0.5 / 2.27
+    assert got.dtype == np.float32 and np.array_equal(got, want)

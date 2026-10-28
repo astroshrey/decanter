@@ -284,3 +284,65 @@ def test_scombine_descending_input_wcs():
     )
     np.testing.assert_allclose(out, 42.5, rtol=0, atol=2e-5)
     assert np.all(out > 0)
+
+
+def _resample_poly5_aligned_scalar(data, edges, *, flux, dispcor):
+    """resample_poly5 with the aligned-pixel sums as the scalar IRAF loop
+    (``sum = sum + asieval(j)``, one pixel at a time)."""
+    from decanter.utils import iminterp as im
+    in32 = np.asarray(data, dtype=REAL)
+    n = in32.size
+    xmin, xmax = 0.5, n + 0.5
+    temp = np.concatenate([in32[:1], in32, in32[-1:]]).astype(REAL)
+    pcoeff = per_segment_pcoeff_poly5(asifit_poly5(temp))
+    x = np.asarray(edges, dtype=np.float64)
+    ofb = (x < xmin) | (x > xmax)
+    e = (np.maximum(xmin, np.minimum(xmax, x)) + 1.0).astype(REAL)
+    a, b = e[:-1], e[1:]
+    lo = np.where(a <= b, a, b)
+    hi = np.where(a <= b, b, a)
+    lo5 = (lo + REAL(0.5)).astype(REAL)
+    hi5 = (hi - REAL(0.5)).astype(REAL)
+    jlo, jhi = im._nint(lo5), im._nint(hi5)
+    aligned = (np.abs(lo5 - jlo.astype(REAL)) < REAL(1e-5)) & \
+              (np.abs(hi5 - jhi.astype(REAL)) < REAL(1e-5))
+    out = asigrl_poly5(pcoeff, lo, hi)
+    for k in np.nonzero(aligned)[0]:
+        acc = REAL(0)
+        for j in range(int(jlo[k]), int(jhi[k]) + 1):
+            acc = REAL(acc + temp[j - 1])
+        if not dispcor and jhi[k] - jlo[k] > 0:
+            acc = REAL(acc / REAL(jhi[k] - jlo[k]))
+        out[k] = acc
+    width = (hi - lo).astype(REAL)
+    if dispcor:
+        if not flux:
+            out = (out / np.maximum(width, REAL(1e-4))).astype(REAL)
+        out = np.where(ofb[:-1] & ofb[1:], REAL(0), out)
+    else:
+        safe = np.where(width > 0, width, REAL(1))
+        out = np.where(~aligned & (width > 0), (out / safe).astype(REAL), out)
+    return out.astype(REAL)
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_resample_poly5_vectorised_aligned_sums_match_scalar_loop(seed):
+    from decanter.utils.iminterp import resample_poly5
+    rng = np.random.default_rng(seed)
+    for trial in range(40):
+        n = int(rng.integers(5, 200))
+        data = (rng.standard_normal(n) * 10 ** rng.uniform(-3, 4)).astype(REAL)
+        nout = int(rng.integers(3, 300))
+        if trial % 3 == 0:      # half-pixel edges, 1-3 samples per pixel, off both ends
+            edges = (np.arange(nout + 1) * int(rng.integers(1, 4))
+                     + int(rng.integers(-20, 10)) + 0.5).astype(np.float64)
+        elif trial % 3 == 1:
+            edges = np.sort(rng.uniform(-10, n + 10, nout + 1))
+        else:                   # decreasing, aligned
+            edges = (np.arange(nout + 1)[::-1] * int(rng.integers(1, 3)) + 0.5).astype(np.float64)
+        for dispcor in (True, False):
+            for flux in (True, False):
+                got = resample_poly5(data, edges, flux=flux, xmin=0.5, xmax=n + 0.5,
+                                     dispcor=dispcor)
+                want = _resample_poly5_aligned_scalar(data, edges, flux=flux, dispcor=dispcor)
+                assert np.array_equal(got.view(np.int32), want.view(np.int32))

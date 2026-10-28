@@ -34,6 +34,7 @@ from decanter.io import fits as _fits
 from decanter.io import headers
 from decanter.io.listfile import parse as parse_listfile
 from decanter.utils.iminterp import scombine_linear_poly5
+from decanter.utils.iraf_imio import imio_read_real
 from decanter.utils.iraf_scopy import scopy_wavelength_truncate
 
 # WARP's hardcoded truncate bounds (``Spec1Dtools.py:152`` defaults
@@ -48,6 +49,88 @@ def _sanitize_objname(raw: str) -> str:
     for ch in (" ", "'", "\"", "#", "/"):
         name = name.replace(ch, "_")
     return name
+
+
+def shift_truncated(trunc_data: np.ndarray, cdelt1: float, shift_wave: float, *,
+                    multispec: bool = False) -> np.ndarray:
+    """WARP's ``PySpecshift`` on a truncated ``_m###c`` spectrum (CRVAL1 = 1).
+
+    ``ccwaveshift.py:PySpecshift``: ``scopy`` (a copy), ``specshift`` (adds
+    the shift to the WCS zero point and writes it to the header,
+    ``noao/onedspec/t_specshift.x``), ``scombine(w1=1., dw=CDELT1,
+    nw=NAXIS1)`` (re-reads the header and resamples back onto the
+    unshifted grid). The shift reaches IRAF as pyraf's 12-digit real text,
+    and the shifted zero point crosses the file boundary as IRAF header text,
+    so both round trips are reproduced; the resample maps wavelengths to
+    pixels through the MWCS transform as IRAF does.
+
+    ``multispec``: the row is one aperture of a multi-aperture image (WARP's
+    2-D spectra): ``specshift`` of such an EQUISPEC image converts it to
+    MULTISPEC (``smw_swattrs`` -> ``smw_esms``) whenever the shift changes the
+    zero point, so the shifted zero point first passes ``%.14g`` attribute
+    text (t_specshift.x:sshift, smwswattrs.x).
+
+    ``scombine``'s ``scb_rebin`` (t_scombine.x:381-402) flags every output
+    pixel that gets less than 1 % of an input pixel as missing, and with the
+    one input spectrum ``ic_averager`` writes ``blank`` (0.) there: a shift
+    within 1 % of a whole number of pixels (|shift| / CDELT1 from about 0.99
+    up to 1, from 1.99 up to 2, ...) blanks the edge pixel the shifted
+    spectrum barely reaches (:func:`scb_coverage`).
+    """
+    from decanter.utils.fpemu import iraf_ctod
+    from decanter.utils.iraf_fmt import dtoc3, roundtrip
+    from decanter.wavelength.iraf_wcs import pyraf_real_text
+
+    naxis1 = int(np.asarray(trunc_data).shape[0])
+    shift = iraf_ctod(pyraf_real_text(shift_wave))
+    w1 = 1.0 + shift
+    if multispec and w1 != 1.0:
+        w1 = iraf_ctod(dtoc3(w1, 14, "g"))
+    crval1_in = roundtrip(w1)
+    dw = iraf_ctod(pyraf_real_text(cdelt1))
+    out = scombine_linear_poly5(
+        imio_read_real(trunc_data),    # the input as IRAF reads it (FITS kernel)
+        crval1_in=crval1_in, cdelt1_in=dw,
+        w1_out=1.0, dw_out=dw, nw_out=naxis1, flux=False, mwcs=True,
+    )
+    lo, hi = scb_coverage(crval1_in, dw, naxis1, 1.0, dw, naxis1)
+    if lo > 1 or hi < naxis1:
+        out = np.array(out, dtype=np.float32)
+        out[:max(0, lo - 1)] = np.float32(0.0)       # scombine's blank
+        out[max(hi, 0):] = np.float32(0.0)
+    return out
+
+
+def scb_coverage(crval1_in: float, cdelt1_in: float, n_in: int,
+                 w1_out: float, dw_out: float, n_out: int) -> tuple[int, int]:
+    """The output pixels ``lo..hi`` (1-based) ``scombine`` keeps of one input.
+
+    ``scb_rebin`` (t_scombine.x:381-402) maps the input's pixel edges ``0.5``
+    and ``SN + 0.5`` to output pixels, ``shdr_wl(shout, shdr_lw(shin, x))``,
+    and keeps ``nint(min + 0.01) .. nint(max - 0.01)`` in REAL arithmetic
+    (:func:`~decanter.wavelength.iraf_scombine.scb_rebin_window`); every other
+    output pixel is missing data.  With no overlap at all ``(1, 0)``: the
+    whole output is blank.
+
+    The input is the ``specshift`` output as ``scombine`` re-reads it: an
+    EQUISPEC image (zero point ``crval1_in``, step ``cdelt1_in``, ``n_in``
+    pixels, reference pixel 1, no Lterm) -- a 2-D strip too, which
+    ``specshift`` makes MULTISPEC but ``smw_saveim`` writes back as EQUISPEC
+    because every row got the same shift (smwsaveim.x:59-78) -- and the
+    output ``scombine``'s ``w1``/``dw``/``nw`` grid, EQUISPEC as well; both
+    transforms are the compiled linear MWCS ones
+    (:class:`~decanter.wavelength.iraf_onedspec.Mwcs1D`).
+    """
+    from decanter.wavelength.iraf_onedspec import Mwcs1D
+    from decanter.wavelength.iraf_scombine import D_NONE, scb_rebin_window
+    mw_in = Mwcs1D(W=float(crval1_in), R=1.0, CD=float(cdelt1_in), LTM=1.0, LTV=0.0, old={})
+    mw_out = Mwcs1D(W=float(w1_out), R=1.0, CD=float(dw_out), LTM=1.0, LTV=0.0, old={})
+    c = float(mw_out.wl(mw_in.lw(0.5)))
+    b = float(mw_out.wl(mw_in.lw(float(n_in) + 0.5)))
+    lo, hi, flag = scb_rebin_window(c, b, int(n_out))
+    if flag == D_NONE:
+        return 1, 0
+    return lo, hi
 
 
 def apply_waveshift_one_order(
@@ -71,15 +154,9 @@ def apply_waveshift_one_order(
     trunc = scopy_wavelength_truncate(
         np.asarray(data), header, w1=_TRUNC_W1, w2=_TRUNC_W2,
     )
+    shifted = shift_truncated(trunc.data, float(trunc.header.get("CDELT1", 1.0)),
+                              shift_wave)
     cdelt1 = float(trunc.header.get("CDELT1", 1.0))
-    crval1_in = float(trunc.header.get("CRVAL1", 1.0)) + shift_wave
-    naxis1 = int(trunc.data.shape[0])
-    shifted = scombine_linear_poly5(
-        trunc.data,
-        crval1_in=crval1_in, cdelt1_in=cdelt1,
-        w1_out=1.0, dw_out=cdelt1, nw_out=naxis1,
-        flux=False,
-    )
     out_header = trunc.header.copy()
     out_header["CRVAL1"] = (1.0, "Wavelength at output pixel 1 (post-shift rebin)")
     out_header["CDELT1"] = (cdelt1, "Wavelength step per pixel")

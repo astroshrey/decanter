@@ -35,7 +35,9 @@ from decanter.io import headers
 from decanter.io.iraf_id import parse as parse_id
 from decanter.io.iraf_id import pixels_at_wavelength, wavelength_at_pixels
 from decanter.io.listfile import parse as parse_listfile
-from decanter.utils.iminterp import dispcor_linear_poly5
+from decanter.utils.iminterp import resample_poly5
+from decanter.utils.iraf_imio import imio_read_real
+from decanter.wavelength.iraf_msp import dispcor_edges
 
 
 def _sanitize_objname(raw: str) -> str:
@@ -63,34 +65,38 @@ def dispcor_one_order(
     data: np.ndarray,
     header: "_astrofits.Header",
     id_path: Path,
+    *,
+    order_ids: tuple[Path, ...] | None = None,
+    edges_fn=None,
 ) -> tuple[np.ndarray, "_astrofits.Header"]:
     """Pure task function: apply the per-order dispersion solution to one 1D spectrum.
 
-    Mirrors IRAF ``dispcor(flux=NO, linear=YES, dw=INDEF)`` with the
-    POLY5 image interpolator (``onedinterp.par`` default). The output
-    wavelength grid is uniform in λ from ``w(pixel 1)`` to ``w(pixel N)``
-    with N output pixels (matching the input length).
+    Bit-exact IRAF ``dispcor(flux=NO, linear=YES, dw=INDEF)`` with the POLY5
+    interpolator: the output grid comes from ``dc_defaults`` and the
+    output-edge -> input-pixel map from the MWCS multispec inverse (see
+    :mod:`decanter.wavelength.iraf_msp`). ``order_ids`` lists the id files
+    of every order being reduced; the map is computed for all of them in
+    one cached pass, so pass the same tuple for every order (and frame).
+    ``edges_fn`` replaces :func:`~decanter.wavelength.iraf_msp.dispcor_edges`
+    (same signature and result; fast mode passes its FMA-free equivalent).
 
     Returns ``(flux_out, header)`` where ``header`` carries CRVAL1 / CDELT1 /
     CRPIX1 / CTYPE1 / WAT1_001 / REFSPEC1 for the new linear grid.
     """
     sol = parse_id(id_path)
     n = data.shape[0]
-    wave_endpoints = wavelength_at_pixels(sol, np.array([1.0, float(n)]))
-    lam_min = float(min(wave_endpoints))
-    lam_max = float(max(wave_endpoints))
-
-    def _invert(w: np.ndarray) -> np.ndarray:
-        return pixels_at_wavelength(sol, w, xrange=(0.5, n + 0.5))
-
-    flux_out = dispcor_linear_poly5(
-        data, _invert, lam_min, lam_max, n, flux=False,
-    )
+    ids = tuple(str(p) for p in (order_ids or (id_path,)))
+    k = ids.index(str(id_path))
+    w1, dw, nw, edges = (edges_fn or dispcor_edges)(ids, n)
+    nw_k = int(nw[k])
+    flux_out = resample_poly5(
+        imio_read_real(data), edges[k, : nw_k + 1], flux=False, xmin=0.5, xmax=n + 0.5,
+        dispcor=True,
+    )   # the input as IRAF reads it (FITS kernel: utils/iraf_imio)
     out_header = header.copy()
-    cdelt = (lam_max - lam_min) / (n - 1) if n > 1 else 1.0
-    out_header["CRVAL1"] = (lam_min, "Wavelength at output pixel 1")
+    out_header["CRVAL1"] = (float(w1[k]), "Wavelength at output pixel 1")
     out_header["CRPIX1"] = (1.0, "Reference pixel along dispersion")
-    out_header["CDELT1"] = (cdelt, "Wavelength step per pixel")
+    out_header["CDELT1"] = (float(dw[k]), "Wavelength step per pixel")
     out_header["CTYPE1"] = ("LINEAR", "Wavelength axis")
     out_header["WAT1_001"] = (
         f"wtype=linear label=Wavelength units={sol.units}",

@@ -2,17 +2,18 @@ decanter
 ========
 
 A fast, pure-Python reduction pipeline for **WINERED** near-infrared echelle
-spectra. ``decanter`` reproduces WARP — the reference IRAF-based WINERED
-pipeline — to float32 precision across all three instrument modes (HIRES-Y,
-HIRES-J, WIDE), while running much faster and parallelizing trivially over
-frames.
+spectra. ``decanter`` runs the reduction of WARP — the reference IRAF-based
+WINERED pipeline — and, by default, calibrates every frame's wavelengths on the
+OH airglow and telluric H2O lines (:doc:`wavelength`). Its ``warp-clone`` mode
+is bit-identical to WARP across all three instrument modes (HIRES-Y, HIRES-J,
+WIDE).
 
 Install
 -------
 
 .. code-block:: bash
 
-   pip install -e .        # requires numpy, scipy, astropy
+   pip install -e .        # requires numpy, scipy, astropy, jax
 
 Quickstart
 ----------
@@ -31,15 +32,15 @@ Load a calibration set, then reduce your ``(object, sky)`` frame pairs:
    spec = r.obj[(1.30, 163)]        # OrderSpectrum, keyed by (FSR cut, order)
    spec.wavelength, spec.flux       # vacuum-Å grid + flux (counts)
 
-A whole transit is just a loop — each reduction is independent:
+A whole night, every frame on its true telluric wavelength scale:
 
 .. code-block:: python
 
-   calib = decanter.Calibration.from_dir(calib_dir)
-   spectra = [decanter.reduce(obj, calib, sky=sky) for obj, sky in frame_pairs]
+   series = decanter.reduce_many(frame_pairs, calib)
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents
 
+   wavelength
    api

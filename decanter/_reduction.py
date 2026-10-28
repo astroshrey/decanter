@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Mapping
 
+import numpy as np
 from astropy.io import fits as _astrofits
 from numpy.typing import NDArray
 
@@ -36,6 +37,13 @@ class OrderSpectrum:
     crval1: float
     cdelt1: float
     crpix1: float
+    # The header WCS cards WARP writes for this spectrum, as IRAF text
+    # (CRVAL1, CRPIX1, CDELT1, CD1_1, LTV1, LTM1_1). IRAF's MWCS encodes the
+    # same grid with CRVAL1 at physical pixel 1 and a negative CRPIX1, so the
+    # numbers differ from ``crval1``/``crpix1`` above (which describe the
+    # REAL grid the data were resampled onto); downstream code that reads
+    # WARP headers should get these. None when not computed.
+    header_wcs: Mapping[str, str] | None = None
 
     @property
     def wavelength(self) -> NDArray:
@@ -44,6 +52,24 @@ class OrderSpectrum:
         n = self.flux.size
         pixels = np.arange(1, n + 1, dtype=self.flux.dtype)
         return self.crval1 + (pixels - self.crpix1) * self.cdelt1
+
+
+@dataclass(frozen=True, slots=True)
+class OrderSpectrum2D:
+    """A dispersion-corrected 2-D spectrum of one order (WARP's ``Extract 2d
+    spectrum``): ``flux`` is ``(pixels across the aperture, wavelength)``,
+    every row on the linear grid ``crval1 + cdelt1 * (i + 1 - crpix1)``."""
+
+    order: int
+    flux: NDArray
+    crval1: float
+    cdelt1: float
+    crpix1: float = 1.0
+
+    @property
+    def wavelength(self) -> NDArray:
+        n = self.flux.shape[-1]
+        return self.crval1 + self.cdelt1 * (np.arange(n) + 1 - self.crpix1)
 
 
 @dataclass
@@ -69,6 +95,36 @@ class Intermediates:
     spectra_1d: dict[int, NDArray] = field(default_factory=dict)  # s08 per order
     spectra_dispcor: dict[int, NDArray] = field(default_factory=dict)  # s12 per order
 
+    # s11-s13 1-D chain (WARP's 8A-OBJ-1DSPEC / SKY 6-7 products)
+    spectra_trunc: dict[int, NDArray] = field(default_factory=dict)    # s11 _m###c
+    spectra_shifted: dict[int, NDArray] = field(default_factory=dict)  # s11 _m###cs
+    sky_trunc: dict[int, NDArray] = field(default_factory=dict)        # sky _trans1dcut
+    dispcor_wcs: dict[int, object] = field(default_factory=dict)       # s12 header WCS
+
+    # WARP-tree products (reduce(..., _warp_products=True); decanter.warptree)
+    strip_meta: dict[int, tuple] = field(default_factory=dict)   # (CRVAL2 text, CDELT2 text, nrows, xmin, xmax)
+    centersearch: dict[int, tuple] = field(default_factory=dict) # s07 (xcenter, fwhm)
+    slit_profiles: dict[int, tuple] = field(default_factory=dict)  # s07 .dat (med_x, med_y)
+    cr_stats: tuple | None = None         # s02 (pixnum, sigThres) as WARP logs them
+    extra: dict = field(default_factory=dict)  # other WARP-tree arrays (mf1, mf2, noise, maskflat)
+
+    # WARP's Background Subtraction (apall background=<mode>): the plain box
+    # sum (``_m###_none.####``) and the background spectrum (``_bg`` = none -
+    # subtracted) truncated (``_bgc``) and dispersion-corrected (``_bgcw``)
+    spectra_1d_none: dict[int, NDArray] = field(default_factory=dict)
+    bg_trunc: dict[int, NDArray] = field(default_factory=dict)
+    bg_dispcor: dict[int, NDArray] = field(default_factory=dict)
+    bg_dispcor_wcs: dict[int, object] = field(default_factory=dict)   # its header WCS
+    # WARP's Extract 2d spectrum (apall format=strip, ``_m###trans2d.####``,
+    # and resample2Dspec, ``..._resample.####``): (pixels across, lines) arrays,
+    # the strips' REAL aperture limits, and the 2-D chain per variant
+    # ("strip"/"resample"): truncated (``2dcut``), shifted (``2dcuts``)
+    strips_2d: dict[int, NDArray] = field(default_factory=dict)
+    strip_2d_limits: dict[int, tuple] = field(default_factory=dict)
+    strips_2d_resample: dict[int, NDArray] = field(default_factory=dict)
+    twod_trunc: dict[tuple, NDArray] = field(default_factory=dict)     # (variant, m)
+    twod_shifted: dict[tuple, NDArray] = field(default_factory=dict)   # (variant, m)
+
     sky_f: NDArray | None = None          # raw sky flat-divided (s04 sky)
     sky_fm: NDArray | None = None         # sky fixpix'd (s05 sky)
     strips_sky: dict[int, NDArray] = field(default_factory=dict)
@@ -89,12 +145,6 @@ class Reduction:
             ``config.flag_skyemission`` is False.
         intermediates: per-stage diagnostic arrays; non-trivial only
             when ``save_intermediates=True`` was passed.
-        meta: observation metadata carried from the raw object frame
-            (see :data:`decanter.io.headers.FRAME_META_KEYS`), plus
-            ``OBJFRAME``/``SKYFRAME`` and the applied ``WAVSHIFT``.
-            :meth:`write_to` writes it into every output spectrum's header,
-            so mid-times, pointing and instrument configuration are readable
-            off the reduced products.
     """
 
     obj_name: str
@@ -103,7 +153,21 @@ class Reduction:
     obj: Mapping[tuple[float, int], OrderSpectrum]
     sky: Mapping[tuple[float, int], OrderSpectrum] | None = None
     intermediates: Intermediates = field(default_factory=Intermediates)
-    meta: dict[str, Any] = field(default_factory=dict)
+    # Raw-frame primary headers (None for in-memory array input) and the
+    # extraction aperture actually used per order, ``{m: (low, high)}``
+    # relative to the trace, with the aperture database the trace came from.
+    obj_header: _astrofits.Header | None = None
+    sky_header: _astrofits.Header | None = None
+    apertures: Mapping[int, tuple[float, float]] = field(default_factory=dict)
+    aperture_refs: Mapping[int, Path] = field(default_factory=dict)
+    shift_wave: float = 0.0
+    # Free path: per order, the center-search fits that hit scipy 1.15.3's
+    # non-deterministic C MINPACK read (FrameApertureSolution.minpack_undefined).
+    centersearch_undefined: Mapping[int, int] = field(default_factory=dict)
+    # Extract 2d spectrum: the dispersion-corrected 2-D spectra per order
+    # (WARP's ``twodspec/VAC/*2dcutsw_VAC`` and ``*2dcutsw_resample_VAC``)
+    obj_2d: Mapping[int, OrderSpectrum2D] = field(default_factory=dict)
+    obj_2d_resample: Mapping[int, OrderSpectrum2D] = field(default_factory=dict)
 
     @property
     def orders(self) -> tuple[int, ...]:
@@ -116,7 +180,11 @@ class Reduction:
         return tuple(sorted({c for c, _ in self.obj}))
 
     def write_to(self, workdir: Path, *, save_intermediates: bool = False) -> None:
-        """Write the reduction's outputs to ``workdir`` (WARP suffix layout).
+        """Write the reduction's outputs to ``workdir`` (flat, WARP file suffixes).
+
+        This is a quick single-frame dump. For a tree downstream code can read
+        exactly like WARP's (frame directories, headers, aperture databases,
+        logs) use :func:`decanter.reduce_to_warp_tree`.
 
         Always writes the final ``_fsr{cut}_VAC.fits`` files (one per
         order × fsr_cut for obj, and same for sky if present). If
@@ -137,13 +205,6 @@ class Reduction:
             h["CDELT1"] = (spec.cdelt1, "Wavelength step per pixel")
             h["CRPIX1"] = (spec.crpix1, "Reference pixel along dispersion")
             h["CTYPE1"] = ("LINEAR", "Wavelength axis")
-            h["ECHORDER"] = (spec.order, "Echelle order number")
-            h["FSRCUT"] = (spec.fsr_cut, "Free-spectral-range cut fraction")
-            for key, value in self.meta.items():
-                try:
-                    h[key] = value
-                except (ValueError, KeyError):
-                    continue
             return h
 
         # Final obj spectra

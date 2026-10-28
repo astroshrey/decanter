@@ -35,6 +35,19 @@ def test_combine_rejects_empty() -> None:
         decanter.combine([])
 
 
+def test_comp_dy_raises_without_cdelt1_like_warp(tmp_path) -> None:
+    """dy is the comp CDELT1; WARP raises when it is missing, so must we."""
+    from decanter.api import _comp_dy
+    p = tmp_path / "comp.fits"
+    fits.PrimaryHDU(np.zeros((2, 2), np.float32)).writeto(p)
+    with pytest.raises(KeyError, match="CDELT1"):
+        _comp_dy(p)
+    h = fits.Header()
+    h["CDELT1"] = 1.0
+    fits.PrimaryHDU(np.zeros((2, 2), np.float32), header=h).writeto(p, overwrite=True)
+    assert _comp_dy(p) == 1.0
+
+
 @pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
 def test_reduce_many_aligns_and_combines() -> None:
     """reduce_many() aligns frames and combine() stacks them onto one grid.
@@ -42,7 +55,7 @@ def test_reduce_many_aligns_and_combines() -> None:
     Reducing the same pair twice gives a 2-frame series with zero relative
     shift; the combined master matches the per-frame spectra."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    series = decanter.reduce_many([(_RAW_OBJ, _RAW_SKY), (_RAW_OBJ, _RAW_SKY)], calib)
+    series = decanter.reduce_many([(_RAW_OBJ, _RAW_SKY), (_RAW_OBJ, _RAW_SKY)], calib, mode="warp-clone")
     assert len(series.reductions) == 2
     assert series.shifts.shape == (2,)
     assert abs(float(series.shifts[series.refid])) < 1e-9      # reference shift is 0
@@ -64,7 +77,7 @@ def test_reduce_matches_warp_on_toi2109_decanterref_m163_fsr105() -> None:
     for m163 within the s06+s08 algorithmic noise floor (medrel < 0.01%,
     same shape, same CRVAL1)."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY)
+    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY, mode="warp-clone")
     spec = r.obj[(1.05, 163)]
 
     warp_data = fits.getdata(_WARP_M163_FSR105).astype(np.float64)
@@ -73,9 +86,11 @@ def test_reduce_matches_warp_on_toi2109_decanterref_m163_fsr105() -> None:
     assert spec.flux.shape == warp_data.shape, (
         f"shape mismatch: decanter {spec.flux.shape} vs WARP {warp_data.shape}"
     )
-    assert abs(spec.crval1 - float(warp_hdr["CRVAL1"])) < 1e-3, (
-        f"CRVAL1 mismatch: decanter {spec.crval1} vs WARP {warp_hdr['CRVAL1']}"
-    )
+    # The header WCS decanter writes is WARP's, digit for digit (the
+    # OrderSpectrum crval1/crpix1 describe the REAL resampling grid instead).
+    text = {c.keyword: c.image[10:30].strip() for c in warp_hdr.cards}
+    for key in ("CRVAL1", "CRPIX1", "CDELT1", "CD1_1", "LTV1", "LTM1_1"):
+        assert spec.header_wcs[key] == text[key], (key, spec.header_wcs[key], text[key])
     diff = spec.flux.astype(np.float64) - warp_data
     medrel = float(np.median(np.abs(diff) / np.maximum(np.abs(warp_data), 1.0)))
     assert medrel < 1e-4, f"medrel too high: {medrel * 100:.4f}%"
@@ -88,8 +103,7 @@ def test_reduce_returns_intermediates_when_requested(tmp_path: Path) -> None:
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
     r = decanter.reduce(
         _RAW_OBJ, calib, sky=_RAW_SKY,
-        workdir=tmp_path, save_intermediates=True,
-    )
+        workdir=tmp_path, save_intermediates=True, mode="warp-clone")
     # 2D intermediates exist:
     assert r.intermediates.obj_s is not None
     assert r.intermediates.obj_sscfm is not None
@@ -106,7 +120,7 @@ def test_reduce_returns_intermediates_when_requested(tmp_path: Path) -> None:
 def test_reduce_orders_property_lists_26_orders() -> None:
     """Default Config processes all 26 orders 159..184."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY)
+    r = decanter.reduce(_RAW_OBJ, calib, sky=_RAW_SKY, mode="warp-clone")
     assert r.orders == tuple(range(159, 185))
     assert r.fsr_cuts == (1.05, 1.3)
 
@@ -129,8 +143,8 @@ def test_standalone_trace_matches_warp_locked() -> None:
     assert calib_locked.ref_trans_apdbs, "fixture should carry multihole trans refs"
     calib_standalone = dataclasses.replace(calib_locked, trans_apdbs=None)
 
-    r_locked = decanter.reduce(_RAW_OBJ, calib_locked, sky=_RAW_SKY)
-    r_standalone = decanter.reduce(_RAW_OBJ, calib_standalone, sky=_RAW_SKY)
+    r_locked = decanter.reduce(_RAW_OBJ, calib_locked, sky=_RAW_SKY, mode="warp-clone")
+    r_standalone = decanter.reduce(_RAW_OBJ, calib_standalone, sky=_RAW_SKY, mode="warp-clone")
 
     worst = 0.0
     for key, spec in r_locked.obj.items():
@@ -141,6 +155,36 @@ def test_standalone_trace_matches_warp_locked() -> None:
     assert worst < 5e-3, f"standalone vs WARP-locked medrel too high: {worst * 100:.3f}%"
 
 
+def test_centersearch_abba_matches_warp() -> None:
+    """WARP's center-search abbaflag: no 'O' in NODPOS and NODPOS != 'NA'
+    (Warp_sci.py:395); a missing NODPOS reads as 'N/A', which is ABBA."""
+    from decanter.api import _centersearch_abba
+    assert _centersearch_abba("A1") and _centersearch_abba("B") and _centersearch_abba("N/A")
+    assert not _centersearch_abba("NA")
+    assert not _centersearch_abba("O") and not _centersearch_abba("OS")
+
+
+@pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
+def test_locked_path_without_db_for_an_order_solves_that_order() -> None:
+    """Locked extraction with no per-frame DB for one order falls back to the
+    center search for that order (it used to dereference a missing free-path
+    solution); every other order stays on WARP's DBs."""
+    import dataclasses
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", decanter.calib.LockedAperturesWarning)
+        full = decanter.Calibration.from_dir(_TOI_PYWARPREF)
+    part = dataclasses.replace(
+        full, trans_apdbs={m: p for m, p in full.trans_apdbs.items() if m != 163})
+    cfg = decanter.Config(selected_orders=(162, 163), reduce_full_data=False)
+    r_full = decanter.reduce(_RAW_OBJ, full, sky=_RAW_SKY, config=cfg, mode="warp-clone")
+    r_part = decanter.reduce(_RAW_OBJ, part, sky=_RAW_SKY, config=cfg, mode="warp-clone")
+    for cut in r_full.fsr_cuts:
+        assert np.array_equal(r_part.obj[(cut, 162)].flux, r_full.obj[(cut, 162)].flux)
+        assert np.isfinite(r_part.obj[(cut, 163)].flux).all()
+
+
 @pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
 def test_reduce_a_only_no_sky() -> None:
     """Reducing a single nod position (sky=None) works end to end.
@@ -149,16 +193,34 @@ def test_reduce_a_only_no_sky() -> None:
     resolved for the center-search aperture solve (regression for a NameError
     on ``nodpos`` when the CR-mask branch was skipped)."""
     calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
-    r = decanter.reduce(_RAW_OBJ, calib)                       # no sky
+    r = decanter.reduce(_RAW_OBJ, calib, mode="warp-clone")                       # no sky
     assert (1.05, 163) in r.obj and r.obj[(1.05, 163)].flux.size > 0
-    r_bg = decanter.reduce(_RAW_OBJ, calib, subtract_background=True)
+    r_bg = decanter.reduce(_RAW_OBJ, calib, subtract_background=True, mode="warp-clone")
     assert (1.05, 163) in r_bg.obj and r_bg.obj[(1.05, 163)].flux.size > 0
 
 
 def test_reduce_rejects_unimplemented_mode() -> None:
-    """Only mode='warp' exists today; other recipes raise before any I/O."""
+    """Only 'default' and 'warp-clone' exist; other modes raise before any I/O."""
     import pytest
 
     import decanter
-    with pytest.raises(ValueError, match="not implemented"):
-        decanter.reduce("obj.fits", None, mode="default")
+    for bad in ("warp", "warp-reference", "fast"):
+        with pytest.raises(ValueError, match="not a decanter mode"):
+            decanter.reduce("obj.fits", None, mode=bad)
+
+
+@pytest.mark.skipif(not _LIVE_DATA_OK, reason="live WINERED data not available")
+def test_reduce_many_workdir(tmp_path) -> None:
+    """reduce_many(workdir=) writes one directory of final spectra per frame and,
+    in the default mode, the wavelength calibration as JSON."""
+    import json
+
+    calib = decanter.Calibration.from_dir(_TOI_PYWARPREF)
+    cfg = decanter.Config(reduce_full_data=False, selected_orders=(159, 163))
+    series = decanter.reduce_many([(_RAW_OBJ, _RAW_SKY), (_RAW_SKY, _RAW_OBJ)], calib,
+                                  config=cfg, workdir=tmp_path)
+    for i, r in enumerate(series.reductions, start=1):
+        files = sorted((tmp_path / f"{r.obj_name}_NO{i}").glob("*_VAC.fits"))
+        assert len(files) == len(r.obj) + len(r.sky or {})
+    rec = json.loads((tmp_path / "decanter_wavecal.json").read_text())
+    assert len(rec["z_star_kms"]) == 2 and len(rec["s11_shift_per_order"]) == 2

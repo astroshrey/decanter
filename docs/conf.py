@@ -15,7 +15,7 @@ copyright = "2026, Shreyas Vissapragada"
 try:
     release = importlib.metadata.version("decanter")
 except importlib.metadata.PackageNotFoundError:  # not installed (e.g. bare checkout)
-    release = "0.0.1"
+    release = "1.1.1"
 version = release
 
 extensions = [

@@ -12,6 +12,8 @@ we read the WARP-supplied set.
 """
 from __future__ import annotations
 
+import re as _re
+import warnings as _warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +26,18 @@ from ..io import headers as _headers
 # reduction works out of the box; overridable per-call via ``fsr_table``.
 _BUNDLED_FSR_TABLE = Path(__file__).resolve().parent.parent / "data" \
     / "FSR_winered_20190610.txt"
+
+
+class LockedAperturesWarning(UserWarning):
+    """``Calibration.from_dir`` was given a WARP reduction root and loaded its
+    frame-NO1 aperture databases, which lock every frame's extraction to NO1's
+    WARP trace."""
+
+
+class CalibrationFallbackWarning(UserWarning):
+    """A calibration file was not next to ``input_files.txt`` (or in
+    ``extra_cal_roots``) and was taken, by name, from another calibration
+    set under the per-machine data roots."""
 
 
 class CalibrationMismatch(ValueError):
@@ -94,6 +108,9 @@ class Calibration:
             aperture DBs (``ap*_NO{i}_sscfm_m{m}trans``, a reduction output,
             not a calibration product). When present, 1D extraction is locked
             to WARP's exact per-frame trace for bit-parity benches.
+            :meth:`from_dir` on a reduction root fills it with frame NO1's
+            DBs (and warns, :class:`LockedAperturesWarning`): that locks
+            every frame to NO1's trace.
         instrument: the mode/slit/setting this set was taken in (read from
             the comp FITS header), or None if it could not be determined.
             Used by :meth:`assert_matches` to reject mismatched science data.
@@ -151,9 +168,14 @@ class Calibration:
             (the layout WARP leaves behind).
 
         Referenced files are resolved relative to that directory first, then
-        ``extra_cal_roots``, then any ``calibration_*`` directory under the
-        per-machine data roots (:data:`decanter._localpaths.CAL_DATA_ROOTS`) —
-        so a self-contained set needs no extra configuration.
+        ``extra_cal_roots``, so a self-contained set needs no extra
+        configuration. Failing both, a file is taken by name from another
+        ``calibration_*`` directory under the per-machine data roots
+        (:data:`decanter._localpaths.CAL_DATA_ROOTS`; sets whose
+        ``input_files.txt`` names the same flat/mask/comp first) and a
+        :class:`CalibrationFallbackWarning` says which. A WARP reduction root
+        usually lacks the flat and mask, so pass the set it was reduced with
+        in ``extra_cal_roots`` to make that choice explicit.
 
         Args:
             path: a calibration-set directory or a reduction root (see above).
@@ -180,19 +202,37 @@ class Calibration:
                 f"calibration_data/")
 
         fields = _parse_input_files(calib_dir / "input_files.txt")
-        search_roots = (calib_dir,) + tuple(extra_cal_roots) + tuple(
-            p for root in _CAL_DATA_ROOTS for p in root.glob("calibration_*")
-        )
+        own_roots = (calib_dir,) + tuple(Path(r) for r in extra_cal_roots)
+        # Fallback: published sets under the data roots, those whose own
+        # input_files.txt names the same flat/mask/comp first (the set this
+        # one was made from), then the rest.
+        def _same_set(d: Path) -> bool:
+            try:
+                f = _parse_input_files(d / "input_files.txt")
+            except OSError:
+                return False
+            return all(f.get(k) == fields.get(k) for k in ("flat file", "mask file", "comp file"))
+        others = [p for root in _CAL_DATA_ROOTS for p in sorted(root.glob("calibration_*"))
+                  if p.resolve() != calib_dir.resolve()]
+        fallback_roots = tuple([p for p in others if _same_set(p)]
+                               + [p for p in others if not _same_set(p)])
+        search_roots = own_roots + fallback_roots
 
-        flat = _resolve(fields["flat file"], search_roots)
-        static_bp = _resolve(fields["mask file"], search_roots)
-        comp = _resolve(fields["comp file"], search_roots)
+        flat = _resolve_warn(fields["flat file"], own_roots, fallback_roots, calib_dir)
+        static_bp = _resolve_warn(fields["mask file"], own_roots, fallback_roots, calib_dir)
+        comp = _resolve_warn(fields["comp file"], own_roots, fallback_roots, calib_dir)
         ap_name = fields["ap file"]
         apsc_name = fields["ap file for apscatter"]
         # The shared `database/` that hosts ap* + fc* + id* files lives next
         # to the calibration FITS files. Find it by looking for ``apN`` where
         # N = ap_name; that has to exist in the right database/ dir.
         shared_db = _find_db_with(f"ap{ap_name}", search_roots)
+        if not any(shared_db in (r / "database", r) for r in own_roots):
+            _warnings.warn(
+                f"Calibration.from_dir({calib_dir}): no database/ with ap{ap_name} "
+                f"there; using {shared_db} from another calibration set (matched by "
+                f"file name only). Check it is the set this reduction used.",
+                CalibrationFallbackWarning, stacklevel=2)
         apdb_multihole = shared_db / f"ap{ap_name}"
         apdb_apsc = shared_db / f"ap{apsc_name}"
         fc_refname = fields["aptrans file"]
@@ -210,14 +250,28 @@ class Calibration:
                 continue
 
         # Discover per-frame trans aperture DBs (a reduction output, present
-        # only when pointed at a WARP reduction root) — best-effort.
+        # only when pointed at a WARP reduction root) — best-effort. WARP
+        # names them ``_sscfm_`` with Apscatter, ``_sfm_`` without
+        # (Warp_sci.py:284-297).
         trans_apdbs: dict[int, Path] = {}
-        for cand in shared_db.glob("ap*_NO1_sscfm_m*trans"):
-            try:
-                mstr = cand.name.split("_sscfm_m")[1].split("trans")[0]
-                trans_apdbs[int(mstr)] = cand
-            except (IndexError, ValueError):
-                continue
+        for fm in ("sscfm", "sfm"):
+            for cand in shared_db.glob(f"ap*_NO1_{fm}_m*trans"):
+                mm = _re.search(rf"_NO1_{fm}_m(\d+)trans$", cand.name)
+                if mm:
+                    trans_apdbs[int(mm.group(1))] = cand
+            if trans_apdbs:
+                break
+
+        if trans_apdbs:
+            _warnings.warn(
+                f"Calibration.from_dir({path}): a WARP reduction root, so its "
+                f"frame-NO1 aperture databases ({len(trans_apdbs)} orders) are "
+                f"loaded as trans_apdbs and reduce() will extract EVERY frame on "
+                f"NO1's WARP trace (locked path). For decanter's own per-frame "
+                f"apertures use dataclasses.replace(calib, trans_apdbs=None) or "
+                f"point from_dir at the calibration set; reduce_to_warp_tree "
+                f"locks each frame to its own databases via apertures=<root>.",
+                LockedAperturesWarning, stacklevel=2)
 
         if fsr_table is None:
             fsr_table = _BUNDLED_FSR_TABLE
@@ -263,16 +317,31 @@ def _parse_input_files(path: Path) -> dict[str, str]:
     return fields
 
 
-def _resolve(name: str, search_roots: tuple[Path, ...]) -> Path:
-    """Find ``<root>/<name>`` for the first root in ``search_roots`` that has it."""
-    for root in search_roots:
-        cand = root / name
-        if cand.exists():
-            return cand
-    raise FileNotFoundError(
-        f"could not resolve calibration file {name!r} in any of "
-        f"{[str(r) for r in search_roots]}"
-    )
+def _resolve_warn(name: str, own_roots: tuple[Path, ...],
+                  fallback_roots: tuple[Path, ...], calib_dir: Path) -> Path:
+    """Find ``name`` in the set's own directory (and ``extra_cal_roots``);
+    failing that, in other published sets, with a :class:`CalibrationFallbackWarning`
+    naming the set it came from and any other set holding a different file of
+    the same name."""
+    for root in own_roots:
+        if (root / name).exists():
+            return root / name
+    hits = [r / name for r in fallback_roots if (r / name).exists()]
+    if not hits:
+        raise FileNotFoundError(
+            f"could not resolve calibration file {name!r} in any of "
+            f"{[str(r) for r in own_roots + fallback_roots]}")
+    chosen = hits[0]
+    differing = [h for h in hits[1:] if h.stat().st_size != chosen.stat().st_size
+                 or h.read_bytes() != chosen.read_bytes()]
+    _warnings.warn(
+        f"Calibration.from_dir({calib_dir}): {name} is not in that directory; "
+        f"using {chosen} (another calibration set, matched by file name only)."
+        + (f" DIFFERENT files of the same name exist in: "
+           f"{', '.join(str(h.parent) for h in differing)}." if differing else "")
+        + " Pass extra_cal_roots=[<the set this reduction used>] to choose explicitly.",
+        CalibrationFallbackWarning, stacklevel=3)
+    return chosen
 
 
 def _find_db_with(filename: str, search_roots: tuple[Path, ...]) -> Path:

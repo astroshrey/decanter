@@ -1,54 +1,23 @@
-"""Absolute wavelength calibration for a set of frames.
+"""Physical wavelength calibration on OH airglow and telluric H2O lines.
 
-:mod:`decanter.waveshift` measures a *relative* frame-to-frame offset by
-cross-correlating each frame against a reference frame, reproducing WARP's
-``ccwaveshift``: enough to stack a series, but the stack keeps whatever
-absolute error the comparison-lamp solution carried.
+The period ThAr solution is kept as a fixed shape template; what moves during
+a night is measured on the atmosphere, frame by frame, in velocity units:
+``z_sky`` from the OH lines of the sky spectra (the instrument) and
+``z_star`` from the telluric H2O lines of the object spectra (the
+starlight). See :mod:`decanter.wavecal.model` for the method and its
+validation. Needs the optional ``wavecal`` extra (JAX).
 
-:mod:`decanter.wavecal` measures every frame against templates generated from
-HITRAN line data — telluric absorption in the object spectrum, OH airglow
-emission in the paired sky spectrum — so the correction is absolute, anchored
-to the telluric rest frame.
+    import decanter, decanter.wavecal as wc
+    series = decanter.reduce_many(pairs, calib)
+    sol = wc.anchor_reduction(series, calib)     # night series, single frame or sparse epochs
+    sol.z_star, sol.z_star_err                   # km/s per object frame
+    u = sol.labels(163, lam, kind="star")        # ln(lambda_true / lambda_label) per pixel
+    flux = wc.export_resample(flux, lam, u, lam) # the one resample
 
-Four modes, set by ``WavecalConfig.mode``:
-
-============== ================================ =========================
-mode           reference                        per exposure
-============== ================================ =========================
-oh_static      OH only                          shift only
-oh_refit       OH only                          band amplitudes + shift
-hybrid_static  telluric, OH where no telluric   shift only
-hybrid_refit   same                             columns / bands + shift
-============== ================================ =========================
-
-The public default is ``mode="auto"``: HIRES-Y and HIRES-J resolve to
-``hybrid_refit``, WIDE to ``hybrid_static``. The selector is not a fifth
-method; the saved solution always records one of the four modes above.
-
-Applying a solution rescales the linear WCS rather than resampling the flux:
-on a grid linear in wavelength, dividing ``CRVAL1`` and ``CDELT1`` by
-``1 + v/c`` is exact.
+A WARP reduction directory works too: ``wc.anchor(wc.load_warp_night(root))``.
 """
+from decanter.wavecal.model import *  # noqa: F403
+from decanter.wavecal.model import __all__ as _model_all
+from decanter.wavecal.plots import pick_line, telluric_check
 
-from decanter.wavecal.config import WavecalConfig
-from decanter.wavecal.directory import apply_solution_to_directory
-from decanter.wavecal.products import airglow_product, telluric_product
-from decanter.wavecal.report import wavecal_report_pdf
-from decanter.wavecal.series import Series, from_reductions, load_series
-from decanter.wavecal.solution import C_KMS, WavecalSolution
-from decanter.wavecal.solve import WavecalRun, solve
-
-__all__ = [
-    "C_KMS",
-    "Series",
-    "WavecalConfig",
-    "WavecalRun",
-    "WavecalSolution",
-    "apply_solution_to_directory",
-    "from_reductions",
-    "load_series",
-    "solve",
-    "wavecal_report_pdf",
-    "airglow_product",
-    "telluric_product",
-]
+__all__ = [*_model_all, "pick_line", "telluric_check"]
